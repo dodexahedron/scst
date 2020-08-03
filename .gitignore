@@ -74,3 +74,5 @@ srpt/conftest/*/result-*.txt
 TAGS
 usr/fileio/fileio_tgt
 usr/stpgd/stpgd
+scst-dkms.spec
+scst.spec
