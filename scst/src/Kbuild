@@ -13,6 +13,10 @@ ccflags-y += -I$(src)/../include\
 #ccflags-y += -DCONFIG_SCST_DEBUG_SN
 #ccflags-y += -DCONFIG_SCST_DEBUG_SYSFS_EAGAIN
 
+#Uncomment below for basic architecture optimizations for the platform
+#you're building on (if building with GCC)
+#ccflags-y += -mtune=native -march=native
+
 # If defined, makes SCST zero allocated data buffers.
 # Undefining it considerably improves performance and eases CPU load,
 # but could create a security hole (information leakage), so
