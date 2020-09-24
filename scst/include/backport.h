@@ -240,6 +240,24 @@ static inline void cpu_to_be32_array(__be32 *dst, const u32 *src, size_t len)
 #define __percpu
 #endif
 
+/* <linux/compiler_attributes.h> */
+
+/* See also commit 294f69e662d1 ("compiler_attributes.h: Add 'fallthrough'
+ * pseudo keyword for switch/case use") # v5.4
+ */
+#ifndef fallthrough
+#if __GNUC__ >= 5
+#if __has_attribute(__fallthrough__)
+#define fallthrough __attribute__((__fallthrough__))
+#else
+#define fallthrough do {} while (0)  /* fallthrough */
+#endif
+#else
+/* gcc 4.x doesn't support __has_attribute() */
+#define fallthrough do {} while (0)  /* fallthrough */
+#endif
+#endif
+
 /* <linux/cpumask.h> */
 
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(2, 6, 20) && !defined(BACKPORT_LINUX_CPUMASK_H)
@@ -524,7 +542,12 @@ kernel_write_backport(struct file *file, const void *buf, size_t count,
 		      loff_t *pos)
 {
 #ifndef CONFIG_SUSE_KERNEL
-	return kernel_write(file, buf, count, *pos);
+	int res = kernel_write(file, buf, count, *pos);
+
+	if (res > 0)
+		*pos += res;
+
+	return res;
 #else
 	return kernel_write(file, buf, count, pos);
 #endif
@@ -1711,6 +1734,16 @@ static inline struct kmem_cache *kmem_cache_create_usercopy(const char *name,
 			__alignof__(struct __struct), (__flags),	\
 			offsetof(struct __struct, __field),		\
 			sizeof_field(struct __struct, __field), NULL)
+#endif
+
+/* <linux/sockptr.h> */
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
+/* See also commit ba423fdaa589 ("net: add a new sockptr_t type") # v5.9 */
+static inline void __user *KERNEL_SOCKPTR(void *p)
+{
+	return (void __force __user *)p;
+}
 #endif
 
 /* <linux/stddef.h> */

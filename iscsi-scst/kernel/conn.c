@@ -759,12 +759,6 @@ int conn_activate(struct iscsi_conn *conn)
 	return 0;
 }
 
-/*
- * Note: the code below passes a kernel space pointer (&opt) to setsockopt()
- * while the declaration of setsockopt specifies that it expects a user space
- * pointer. This seems to work fine, and this approach is also used in some
- * other parts of the Linux kernel (see e.g. fs/ocfs2/cluster/tcp.c).
- */
 static int conn_setup_sock(struct iscsi_conn *conn)
 {
 	int res = 0;
@@ -791,7 +785,7 @@ static int conn_setup_sock(struct iscsi_conn *conn)
 	oldfs = get_fs();
 	set_fs(KERNEL_DS);
 	conn->sock->ops->setsockopt(conn->sock, SOL_TCP, TCP_NODELAY,
-		(void __force __user *)&opt, sizeof(opt));
+				    KERNEL_SOCKPTR(&opt), sizeof(opt));
 	set_fs(oldfs);
 
 out:

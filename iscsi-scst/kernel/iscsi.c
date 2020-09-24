@@ -2895,7 +2895,7 @@ static inline void set_cork(struct socket *sock, int on)
 	oldfs = get_fs();
 	set_fs(KERNEL_DS);
 	sock->ops->setsockopt(sock, SOL_TCP, TCP_CORK,
-			      (void __force __user *)&opt, sizeof(opt));
+			      KERNEL_SOCKPTR(&opt), sizeof(opt));
 	set_fs(oldfs);
 	return;
 }
@@ -3375,7 +3375,7 @@ static void iscsi_try_local_processing(struct iscsi_cmnd *req)
 	switch (conn->wr_state) {
 	case ISCSI_CONN_WR_STATE_IN_LIST:
 		list_del(&conn->wr_list_entry);
-		/* fall through */
+		fallthrough;
 	case ISCSI_CONN_WR_STATE_IDLE:
 #ifdef CONFIG_SCST_EXTRACHECKS
 		conn->wr_task = current;
