@@ -129,7 +129,7 @@ function extract_kernel_tree {
 function patch_kernel {
     case "$1" in
 	*^*)
-            # RHEL / CentOS.
+            # RHEL / CentOS or UEK.
             ;;
 	*)
 	    # See also commit f153b82121b0 ("Sanitize gcc version header
@@ -137,10 +137,13 @@ function patch_kernel {
 	    # support for gcc 5") # v3.18. See also commit cb984d101b30
 	    # ("compiler-gcc: integrate the various compiler-gcc[345].h
 	    # files") # v4.2.
-	    if kernel_version_le 2.6.29 $1 && kernel_version_lt $1 4.2; then
+	    if kernel_version_le 2.6.29 "$1" && kernel_version_lt "$1" 4.2; then
 		# Tell the kernel that we are using gcc 4.6 since older kernel
-		# versions do not support recent gcc versions.
-		patch -f -s -p1 <<'EOF' ||
+		# versions do not support recent gcc versions. See also commit
+		# 9c695203a7dd ("compiler-gcc.h: gcc-4.5 needs noclone and
+		# noinline on __naked functions") # v2.6.35.
+		if kernel_version_le 2.6.34.2 "$1"; then
+		    patch -f -s -p1 <<'EOF'
 diff --git a/include/linux/compiler-gcc.h b/include/linux/compiler-gcc.h
 index 02ae99e8e6d3..47e12c19c965 100644
 --- a/include/linux/compiler-gcc.h
@@ -155,7 +158,8 @@ index 02ae99e8e6d3..47e12c19c965 100644
  #if !defined(__noclone)
  #define __noclone	/* not needed */
 EOF
-		patch -f -s -p1 <<'EOF'
+		else
+		    patch -f -s -p1 <<'EOF'
 diff --git a/include/linux/compiler-gcc.h b/include/linux/compiler-gcc.h
 index a3ed7cb8ca34..c5a6b8b52db4 100644
 --- a/include/linux/compiler-gcc.h
@@ -167,7 +171,11 @@ index a3ed7cb8ca34..c5a6b8b52db4 100644
 -#include gcc_header(__GNUC__)
 +#include "linux/compiler-gcc4.h"
 EOF
-		patch -f -s -p1 <<'EOF' ||
+		fi
+		# See also commit 733ed6e43756 ("compiler-gcc{3,4}.h: Use
+		# GCC_VERSION macro") # v3.9.
+		if kernel_version_le 3.9 "$1"; then
+		    patch -f -s -p1 <<'EOF'
 diff --git a/include/linux/compiler-gcc4.h b/include/linux/compiler-gcc4.h
 index 769e19864632..2ec6c7a11502 100644
 --- a/include/linux/compiler-gcc4.h
@@ -187,7 +195,8 @@ index 769e19864632..2ec6c7a11502 100644
  #define __must_check 		__attribute__((warn_unused_result))
  #define __compiler_offsetof(a,b) __builtin_offsetof(a,b)
 EOF
-		patch -f -s -p1 <<'EOF'
+		else
+		    patch -f -s -p1 <<'EOF'
 diff --git a/include/linux/compiler-gcc4.h b/include/linux/compiler-gcc4.h
 index 412bc6c2b023..901ca31be7f8 100644
 --- a/include/linux/compiler-gcc4.h
@@ -207,31 +216,10 @@ index 412bc6c2b023..901ca31be7f8 100644
  #define __must_check 		__attribute__((warn_unused_result))
  #define __compiler_offsetof(a,b) __builtin_offsetof(a,b)
 EOF
+		fi
 	    fi
 	    ;;
     esac
-
-    if [ "$1" = "2.6.29" ] || [ "$1" = "2.6.29.1" ] || [ "$1" = "2.6.29.2" ] ||
-	   [ "$1" = "2.6.29.3" ]; then
-      patch -f -s -p1 <<'EOF'
-Make sure that branch profiling does not trigger sparse warnings.
-See also http://bugzilla.kernel.org/show_bug.cgi?id=12925
----
-See also http://lkml.org/lkml/2009/4/5/120
---- orig/linux-2.6.29/include/linux/compiler.h	2009-03-23 19:12:14.000000000 -0400
-+++ linux-2.6.29/include/linux/compiler.h	2009-03-24 08:46:46.000000000 -0400
-@@ -75,7 +75,8 @@ struct ftrace_branch_data {
-  * Note: DISABLE_BRANCH_PROFILING can be used by special lowlevel code
-  * to disable branch tracing on a per file basis.
-  */
--#if defined(CONFIG_TRACE_BRANCH_PROFILING) && !defined(DISABLE_BRANCH_PROFILING)
-+#if defined(CONFIG_TRACE_BRANCH_PROFILING) \
-+    && !defined(DISABLE_BRANCH_PROFILING) && !defined(__CHECKER__)
- void ftrace_likely_update(struct ftrace_branch_data *f, int val, int expect);
- 
- #define likely_notrace(x)	__builtin_expect(!!(x), 1)
-EOF
-    fi
 
     if [ "${1#2.6.31}" != "$1" ]; then
       patch -f -s -p1 <<'EOF'
@@ -421,7 +409,7 @@ index d6d65537b0d9..6aad8308a0ac 100644
 EOF
     fi
 
-    if kernel_version_le 2.6.36 $1 && kernel_version_lt $1 4.8; then
+    if kernel_version_le 2.6.36 "$1" && kernel_version_lt "$1" 4.8; then
 	patch -f -s -p1 <<'EOF'
 From c6a385539175ebc603da53aafb7753d39089f32e Mon Sep 17 00:00:00 2001
 From: Borislav Petkov <bp@suse.de>
@@ -646,7 +634,7 @@ EOF
 	    ;;
     esac
 
-    if kernel_version_le 3.2 $1 && kernel_version_lt $1 3.18; then
+    if kernel_version_le 3.2 "$1" && kernel_version_lt "$1" 3.18; then
 	patch -f -s -p1 <<'EOF'
 From eeeda4cd06e828b331b15741a204ff9f5874d28d Mon Sep 17 00:00:00 2001
 From: Ben Hutchings <ben@decadent.org.uk>
@@ -688,7 +676,7 @@ EOF
 
     # See also commit e33a814e772c ("scripts/dtc: Remove redundant YYLOC global
     # declaration") # v5.6~10^2.
-    if kernel_version_lt $1 5.6; then
+    if kernel_version_le 2.6.38 "$1" && kernel_version_lt "$1" 5.6; then
 	patch -p1 -f -s <<'EOF'
 From e33a814e772cdc36436c8c188d8c42d019fda639 Mon Sep 17 00:00:00 2001
 From: Dirk Mueller <dmueller@suse.com>
@@ -738,6 +726,18 @@ index 5c6c3fd557d7..b3b7270300de 100644
  extern bool treesource_error;
  
  /* CAUTION: this will stop working if we ever use yyless() or yyunput() */
+diff --git a/scripts/dtc/dtc-lexer.lex.c_shipped b/scripts/dtc/dtc-lexer.lex.c_shipped
+index 5c6c3fd557d7..b3b7270300de 100644
+--- a/scripts/dtc/dtc-lexer.lex.c_shipped
++++ b/scripts/dtc/dtc-lexer.lex.c_shipped
+@@ -23,7 +23,6 @@ LINECOMMENT	"//".*\n
+ #include "srcpos.h"
+ #include "dtc-parser.tab.h"
+ 
+-YYLTYPE yylloc;
+ extern bool treesource_error;
+ 
+ /* CAUTION: this will stop working if we ever use yyless() or yyunput() */
 EOF
     fi
 
@@ -765,7 +765,14 @@ function download_and_extract_distro_rpm {
 	read -a urls -r <<<"$(get_srpm_urls "$distro" "$release" x86_64 |
 			      tr '\n' ' ')"
 	for url in "${urls[@]}"; do
-	    wget -q -nc "${url}/kernel-${kver}.src.rpm" && break
+	    case "$distro" in
+		CentOS)
+		    wget -q -nc "${url}/kernel-${kver}.src.rpm" && break
+		    ;;
+		UEK)
+		    wget -q -nc "${url}/kernel-uek-${kver}.src.rpm" && break
+		    ;;
+	    esac
 	done
     )
     local tmpdir=kernel-tree-tmp-$$
@@ -773,38 +780,60 @@ function download_and_extract_distro_rpm {
     mkdir "${tmpdir}" || return $?
     (
 	cd "${tmpdir}" &&
-	    rpm2cpio "${kernel_downloads}/kernel-${kver}.src.rpm" |
-		cpio -i --make-directories --quiet &&
-	    tar xaf "linux-${kver}.tar."* &&
-	    mv "linux-${kver}" ".." &&
-	    cd "../linux-${kver}"
+	    case "$distro" in
+		CentOS)
+		    rpm2cpio "${kernel_downloads}/kernel-${kver}.src.rpm" |
+			cpio -i --make-directories --quiet &&
+			tar xaf "linux-${kver}.tar."* &&
+			mv "linux-${kver}" ".." &&
+			cd "../linux-${kver}"
+		    ;;
+		UEK)
+		    rpm2cpio "${kernel_downloads}/kernel-uek-${kver}.src.rpm" |
+			cpio -i --make-directories --quiet &&
+			tar xaf "linux-${kver/-*}.tar."* &&
+			mv "linux-${kver/-*}" "../linux-${kver}" &&
+			cd "../linux-${kver}"
+		    ;;
+		*)
+		    echo "Error: unknown distro $distro"
+		    ;;
+	    esac
     ) || return $?
     rm -rf "${tmpdir}"
 }
 
 function download_and_extract_kernel_tree {
-    if [ -e "${kernel_tree}" ]; then
-	{ [ "${1/^}" = "$1" ] &&
-	(
-	    cd "${kernel_tree}" &&
-		{
-		    { git tag -l "v$1" | grep -q '^v'; } ||
-			{
-			    echo "Could not find tag v$1;" \
-				 "updating git repository" 1>&2
-			    git fetch origin
-			    git fetch stable
-			}
-		} &&
-		{ git tag -l "v$1" | grep -q '^v'; } &&
-		git archive "v$1"
-	) | {
-	    rm -rf "linux-$1" &&
-		mkdir "linux-$1" &&
-		tar -C "linux-$1" -xf- 2>/dev/null
-	}; } || download_and_extract_distro_rpm "$1"
+    if [ "${1/^}" = "$1" ]; then
+	# Upstream kernel.
+	if [ -e "${kernel_tree}" ]; then
+	    # If a git kernel tree is available, obtain the kernel source code
+	    # from that git tree.
+	    (
+		cd "${kernel_tree}" &&
+		    {
+			{ git tag -l "v$1" | grep -q '^v'; } ||
+			    {
+				echo "Could not find tag v$1;" \
+				     "updating git repository" 1>&2
+				git fetch origin
+				git fetch stable
+			    }
+		    } &&
+		    { git tag -l "v$1" | grep -q '^v'; } &&
+		    git archive "v$1"
+	    ) | {
+		rm -rf "linux-$1" &&
+		    mkdir "linux-$1" &&
+		    tar -C "linux-$1" -xf- 2>/dev/null
+	    }
+	else
+	    # Otherwise download a source code tar file and extract it.
+	    download_kernel "$1" && extract_kernel_tree "$1"
+	fi
     else
-	download_kernel "$1" && extract_kernel_tree "$1"
+	# Distro kernel.
+	download_and_extract_distro_rpm "$1"
     fi &&
 	(cd "linux-${1/^*}" && patch_kernel "${1/^*}")
 }

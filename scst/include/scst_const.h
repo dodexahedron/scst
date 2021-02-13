@@ -46,7 +46,7 @@
 #define SCST_VERSION(a, b, c, d)    (((a) << 24) + ((b) << 16) + ((c) << 8) + d)
 #define SCST_VERSION_CODE	    SCST_VERSION(3, 4, 0, 0)
 #define SCST_VERSION_STRING_SUFFIX
-#define SCST_VERSION_NAME	    "3.5.0-pre"
+#define SCST_VERSION_NAME	    "3.6.0-pre"
 #define SCST_VERSION_STRING	    SCST_VERSION_NAME SCST_VERSION_STRING_SUFFIX
 
 #define SCST_CONST_VERSION SCST_CONST_INTF_VER
@@ -742,8 +742,8 @@ enum scst_tg_sup {
 
 /*
  * Error code returned by target attribute sysfs methods if invoked after
- * scst_register_target() finished but before before scst_tgt_set_tgt_priv()
- * has been invoked.
+ * scst_register_target() finished but before scst_tgt_set_tgt_priv() has been
+ * invoked.
  */
 enum {
 	E_TGT_PRIV_NOT_YET_SET = EBUSY

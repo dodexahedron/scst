@@ -21,6 +21,9 @@
  */
 
 #include <linux/version.h>
+#ifndef RHEL_RELEASE_VERSION
+#define RHEL_RELEASE_VERSION(a, b) (((a) << 8) + (b))
+#endif
 #include <linux/bio.h>
 #include <linux/blkdev.h>	/* struct request_queue */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 21, 0) || \
@@ -33,6 +36,9 @@
 #include <linux/dmapool.h>
 #include <linux/eventpoll.h>
 #include <linux/iocontext.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 36)
+#include <linux/kobject_ns.h>
+#endif
 #include <linux/scatterlist.h>	/* struct scatterlist */
 #include <linux/slab.h>		/* kmalloc() */
 #include <linux/stddef.h>	/* sizeof_field() */
@@ -155,6 +161,29 @@ static inline int bdev_io_opt(struct block_device *bdev)
 }
 #endif
 
+/*
+ * See also commit d4d77629953e ("block: clean up blkdev_get() wrappers and
+ * their users") # v2.6.38.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 38)
+static inline struct block_device *
+blkdev_get_by_path(const char *path, fmode_t mode, void *holder)
+{
+	struct block_device *bdev;
+	int err;
+
+	bdev = lookup_bdev(path);
+	if (IS_ERR(bdev))
+		return bdev;
+
+	err = blkdev_get(bdev, mode);
+	if (err)
+		return ERR_PTR(err);
+
+	return bdev;
+}
+#endif
+
 /* <linux/bsg-lib.h> */
 
 /*
@@ -192,7 +221,8 @@ static inline void *bsg_job_sense(struct bsg_job *job)
  */
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0) && \
 	(!defined(RHEL_MAJOR) || RHEL_MAJOR -0 < 7 ||	\
-	 RHEL_MAJOR -0 == 7 && RHEL_MINOR -0 < 5)
+	 RHEL_MAJOR -0 == 7 && RHEL_MINOR -0 < 5) && \
+	!defined(UEK_KABI_RENAME)
 static inline void cpu_to_be32_array(__be32 *dst, const u32 *src, size_t len)
 {
 	int i;
@@ -371,6 +401,40 @@ static inline bool cpumask_equal(const cpumask_t *src1p,
 {
 	return bitmap_equal(cpumask_bits(src1p), cpumask_bits(src2p),
 			    nr_cpumask_bits);
+}
+#endif
+
+/* <linux/debugfs.h> */
+
+/*
+ * See also commit c64688081490 ("debugfs: add support for self-protecting
+ * attribute file fops") # v4.7.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 7, 0)
+#define DEFINE_DEBUGFS_ATTRIBUTE(__fops, __get, __set, __fmt)		\
+static int __fops ## _open(struct inode *inode, struct file *file)	\
+{									\
+	__simple_attr_check_format(__fmt, 0ull);			\
+	return simple_attr_open(inode, file, __get, __set, __fmt);	\
+}									\
+static const struct file_operations __fops = {				\
+	.owner	 = THIS_MODULE,						\
+	.open	 = __fops ## _open,					\
+	.release = simple_attr_release,					\
+	.read	 = debugfs_attr_read,					\
+	.write	 = debugfs_attr_write,					\
+	.llseek  = no_llseek,						\
+}
+
+static inline ssize_t debugfs_attr_read(struct file *file, char __user *buf,
+					size_t len, loff_t *ppos)
+{
+	return -ENOENT;
+}
+static inline ssize_t debugfs_attr_write(struct file *file,
+		const char __user *buf, size_t len, loff_t *ppos)
+{
+	return -ENOENT;
 }
 #endif
 
@@ -838,22 +902,28 @@ enum kobj_ns_type {
 };
 #endif
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 24) &&	\
-	LINUX_VERSION_CODE < KERNEL_VERSION(3, 0, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 24) &&		      \
+	LINUX_VERSION_CODE < KERNEL_VERSION(4, 16, 0) &&	      \
+	(!defined(RHEL_MAJOR) || RHEL_MAJOR -0 < 7)
 /*
  * See also commit 5f256becd868 ("[NET]: Basic network namespace
- * infrastructure.") # v2.6.24. a685e08987d1 ("Delay struct net freeing while
- * there's a sysfs instance refering to it") # v3.0.
+ * infrastructure."; v2.6.24). a685e08987d1 ("Delay struct net freeing while
+ * there's a sysfs instance refering to it"; v3.0). See also commit
+ * 172856eac7cf ("kobject: Export kobj_ns_grab_current() and kobj_ns_drop()";
+ * v4.16).
  */
-static inline void *kobj_ns_grab_current(enum kobj_ns_type type)
+static inline void *kobj_ns_grab_current_backport(enum kobj_ns_type type)
 {
 	WARN_ON_ONCE(type != KOBJ_NS_TYPE_NET);
 	return &init_net;
 }
 
-static inline void kobj_ns_drop(enum kobj_ns_type type, void *ns)
+static inline void kobj_ns_drop_backport(enum kobj_ns_type type, void *ns)
 {
 }
+
+#define kobj_ns_grab_current kobj_ns_grab_current_backport
+#define kobj_ns_drop kobj_ns_drop_backport
 #endif
 
 /* <linux/kref.h> */
@@ -954,7 +1024,9 @@ static inline void lockdep_unregister_key(struct lock_class_key *key)
  * See also commit 5facae4f3549 ("locking/lockdep: Remove unused @nested
  * argument from lock_release()").
  */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 5, 0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 5, 0) &&		\
+	(!defined(RHEL_RELEASE_CODE) ||				\
+	 RHEL_RELEASE_CODE -0 < RHEL_RELEASE_VERSION(8, 3))
 #undef rwlock_release
 #define rwlock_release(l, i) lock_release(l, 1, i)
 #undef mutex_release
@@ -981,8 +1053,8 @@ static inline void mempool_destroy_backport(mempool_t *pool)
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 12, 0) &&	\
 	(!defined(RHEL_MAJOR) || RHEL_MAJOR -0 < 7 ||	\
 	 (RHEL_MAJOR -0 == 7 && RHEL_MINOR -0 < 5)) &&	\
-	!defined(UEK_KABI_RENAME) &&			\
 	!defined(_COMPAT_LINUX_MM_H)
+#if !defined(UEK_KABI_RENAME)
 /* See also commit a7c3e901a46f ("mm: introduce kv[mz]alloc helpers") # v4.12 */
 static inline void *kvmalloc_node(size_t size, gfp_t flags, int node)
 {
@@ -1037,6 +1109,7 @@ static inline void *kvzalloc(size_t size, gfp_t flags)
 {
 	return kvmalloc(size, flags | __GFP_ZERO);
 }
+#endif
 
 /*
  * See also commit 752ade68cbd8 ("treewide: use kv[mz]alloc* rather than
@@ -1052,7 +1125,8 @@ static inline void *kvmalloc_array(size_t n, size_t size, gfp_t flags)
 	(!defined(RHEL_MAJOR) || RHEL_MAJOR -0 < 7 ||	\
 	 RHEL_MAJOR -0 == 7 && RHEL_MINOR -0 < 7) &&	\
 	!defined(CONFIG_SUSE_KERNEL) &&			\
-	!defined(_COMPAT_LINUX_MM_H)
+	!defined(_COMPAT_LINUX_MM_H) &&			\
+	!defined(UEK_KABI_RENAME)
 /* See also commit 1c542f38ab8d ("mm: Introduce kvcalloc()") # v4.18. */
 static inline void *kvcalloc(size_t n, size_t size, gfp_t flags)
 {
@@ -1135,7 +1209,7 @@ static inline int pcie_capability_read_word(struct pci_dev *dev, int pos,
 {
 	WARN_ON_ONCE(true);
 	*val = 0;
-	return -ENOTSUPP;
+	return -EOPNOTSUPP;
 }
 
 static inline int pcie_capability_read_dword(struct pci_dev *dev, int pos,
@@ -1143,7 +1217,7 @@ static inline int pcie_capability_read_dword(struct pci_dev *dev, int pos,
 {
 	WARN_ON_ONCE(true);
 	*val = 0;
-	return -ENOTSUPP;
+	return -EOPNOTSUPP;
 }
 #endif
 
@@ -1154,7 +1228,9 @@ static inline int pcie_capability_read_dword(struct pci_dev *dev, int pos,
 #include <linux/percpu-refcount.h>
 #endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 3, 0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 3, 0) &&	\
+	(!defined(RHEL_RELEASE_CODE) ||				\
+	 RHEL_RELEASE_CODE -0 < RHEL_RELEASE_VERSION(8, 3))
 /*
  * See also commit 09ed79d6d75f ("percpu_ref: introduce PERCPU_REF_ALLOW_REINIT
  * flag") # v5.3.
@@ -1172,7 +1248,11 @@ typedef unsigned percpu_count_t;
 #define READ_REF_COUNT(ref) atomic_read(&(ref)->count)
 #else
 typedef unsigned long percpu_count_t;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
 #define READ_REF_COUNT(ref) atomic_long_read(&(ref)->count)
+#else
+#define READ_REF_COUNT(ref) atomic_long_read(&(ref)->data->count)
+#endif
 #endif
 
 /*
@@ -1556,7 +1636,7 @@ typedef void (*rcu_callback_t)(struct rcu_head *);
 	(!defined(RHEL_MAJOR) || RHEL_MAJOR -0 < 7 ||	\
 	 RHEL_MAJOR -0 == 7 && RHEL_MINOR -0 < 7)
 /*
- * See also commit 546a9d8519ed ("rcu: Export debug_init_rcu_head() and and
+ * See also commit 546a9d8519ed ("rcu: Export debug_init_rcu_head() and
  * debug_init_rcu_head()") # v3.16.
  */
 static inline void init_rcu_head(struct rcu_head *head) { }
@@ -1660,6 +1740,28 @@ static inline void sg_unmark_end(struct scatterlist *sg)
  */
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3, 15, 0) && !defined(MIN_NICE)
 #define MIN_NICE -20
+#endif
+
+/* <linux/seq_file.h> */
+
+/*
+ * See also commit a08f06bb7a07 ("seq_file: Introduce DEFINE_SHOW_ATTRIBUTE()
+ * helper macro") # v4.16.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 16, 0)
+#define DEFINE_SHOW_ATTRIBUTE(__name)					\
+static int __name ## _open(struct inode *inode, struct file *file)	\
+{									\
+	return single_open(file, __name ## _show, inode->i_private);	\
+}									\
+									\
+static const struct file_operations __name ## _fops = {			\
+	.owner		= THIS_MODULE,					\
+	.open		= __name ## _open,				\
+	.read		= seq_read,					\
+	.llseek		= seq_lseek,					\
+	.release	= single_release,				\
+}
 #endif
 
 /* <linux/slab.h> */
@@ -1955,6 +2057,24 @@ static inline struct workqueue_struct *alloc_workqueue(const char *fmt,
 }
 #endif
 
+/*
+ * See also commits 18aa9effad4a ("workqueue: implement WQ_NON_REENTRANT";
+ * v2.6.36) and commits dbf2576e37da ("workqueue: make all workqueues
+ * non-reentrant"; v3.7).
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 36) || \
+	LINUX_VERSION_CODE >= KERNEL_VERSION(3, 7, 0)
+#define WQ_NON_REENTRANT 0
+#endif
+
+/*
+ * See also commit 226223ab3c41 ("workqueue: implement sysfs interface for
+ * workqueues"; v3.10).
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 10, 0)
+#define WQ_SYSFS 0
+#endif
+
 /* <rdma/ib_verbs.h> */
 
 /* commit ed082d36 */
@@ -1972,7 +2092,9 @@ static inline struct ib_pd *ib_alloc_pd_backport(struct ib_device *device)
 /* <scsi/scsi_cmnd.h> */
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 24) || \
-	LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)
+	LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0) || \
+	(defined(RHEL_RELEASE_CODE) &&			 \
+	 RHEL_RELEASE_CODE -0 >= RHEL_RELEASE_VERSION(8, 3))
 /*
  * See also patch "[SCSI] bidirectional command support" (commit ID
  * 6f9a35e2dafa). See also commit ae3d56d81507 ("scsi: remove bidirectional

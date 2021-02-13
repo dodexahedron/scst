@@ -125,7 +125,7 @@ function make_dpkg {
 
 function compile_scst {
   (
-    for p in scst scst_local iscsi-scst srpt qla2x00t $(if [ "${mpt_scst}" = "true" ]; then echo mpt; fi); do
+    for p in scst scst_local iscsi-scst srpt qla2x00t qla2x00t-32gbit; do
       if [ "${p%qla2x00t}" != "$p" ]; then
         BUILD_2X_MODULE=y CONFIG_SCSI_QLA_FC=y CONFIG_SCSI_QLA2XXX_TARGET=y \
         make -C "$p/qla2x00-target" || return $?
@@ -209,7 +209,6 @@ function generate_kernel_patch {
 
   kver="$(kernel_version "${1/^*}")"
   driver_options=(-l)
-  [ "${mpt_scst}" = "true" ] && driver_options+=("-m")
 
   "${scriptsdir}"/generate-kernel-patch "${driver_options[@]}" $2 "$1" > "${patchfile}"
 
@@ -269,8 +268,11 @@ CONFIG_BINARY_PRINTF				\
 CONFIG_BLK_DEV_IO_TRACE				\
 CONFIG_BRANCH_PROFILE_NONE			\
 CONFIG_CONTEXT_SWITCH_TRACER			\
+CONFIG_CTF					\
 CONFIG_DEBUG_SECTION_MISMATCH			\
 CONFIG_DEBUG_STRICT_USER_COPY_CHECKS		\
+CONFIG_DTRACE					\
+CONFIG_DT_CORE					\
 CONFIG_DYNAMIC_FTRACE				\
 CONFIG_EVENT_TRACE_TEST_SYSCALLS		\
 CONFIG_FTRACE					\
@@ -288,6 +290,7 @@ CONFIG_HEADERS_CHECK				\
 CONFIG_IRQSOFF_TRACER				\
 CONFIG_IWLWIFI_DEVICE_TRACING			\
 CONFIG_IWM_TRACING				\
+CONFIG_KALLMODSYMS				\
 CONFIG_KVM_MMU_AUDIT				\
 CONFIG_MAC80211_DRIVER_API_TRACER		\
 CONFIG_MMIOTRACE				\
@@ -301,6 +304,7 @@ CONFIG_STACK_TRACER				\
 CONFIG_STACK_VALIDATION				\
 CONFIG_TRACEPOINTS				\
 CONFIG_TRACER_MAX_TRACE				\
+CONFIG_TRACE_BRANCH_PROFILING			\
 CONFIG_TRACING					\
 CONFIG_UNWINDER_ORC				\
 CONFIG_X86_32					\
@@ -379,7 +383,7 @@ function compile_kernel {
 
   echo "Compiling the patched kernel ..."
   if (cd "${outputdir}/linux-$k" \
-      && make -s prepare \
+      && make -s modules_prepare \
       && make -s scripts \
       && for subdir; do LC_ALL=C make -k M="${subdir}"; done
      ) &> "${outputfile}"
@@ -409,7 +413,7 @@ function run_sparse {
 
   echo "Running sparse on the patched kernel in $* ..."
   if (cd "${outputdir}/linux-$k" \
-      && make -s prepare \
+      && make -s modules_prepare \
       && make -s scripts \
       && if grep -q '^CONFIG_PPC=y$' .config; then LC_ALL=C make -k M=arch/powerpc/lib; fi \
       && for subdir; do
@@ -450,7 +454,7 @@ function run_smatch {
   if (cd "${outputdir}/linux-$k" &&
       for c in $disable; do sed -i.tmp "s/^$c=y\$/$c=n/" .config; done &&
       make -s oldconfig </dev/null &&
-      make -s prepare &&
+      make -s modules_prepare &&
       make -s scripts &&
       if grep -q '^CONFIG_PPC=y$' .config; then LC_ALL=C make -k M=arch/powerpc/lib; fi &&
       for subdir; do
@@ -482,7 +486,7 @@ function run_checkstack {
   echo "Running checkstack on the patched $1 kernel ..."
   (
     cd "${outputdir}/linux-$1" \
-    && make -s prepare \
+    && make -s modules_prepare \
     && make -s scripts \
     && LC_ALL=C make -k checkstack
   ) &> "${outputfile}"
@@ -499,7 +503,7 @@ function run_namespacecheck {
   echo "Running namespacecheck on the patched $1 kernel ..."
   (
     cd "${outputdir}/linux-$1" \
-    && make -s prepare \
+    && make -s modules_prepare \
     && make -s scripts \
     && LC_ALL=C make -k namespacecheck
   ) &> "${outputfile}"
@@ -516,7 +520,7 @@ function run_headers_check {
   echo "Running headers check on the patched $1 kernel ..."
   (
     cd "${outputdir}/linux-$1" \
-    && make -s prepare \
+    && make -s modules_prepare \
     && make -s scripts \
     && LC_ALL=C make -k headers_check
   ) &> "${outputfile}"
@@ -536,7 +540,7 @@ function run_make_htmldocs {
   echo "Generating HTML documentation for the patched $1 kernel ..."
   (
     cd "${outputdir}/linux-$1" \
-    && make -s prepare \
+    && make -s modules_prepare \
     && make -s scripts \
     && LC_ALL=C make -k htmldocs
   ) &> "${outputfile}"
@@ -567,7 +571,6 @@ kernel_versions=""
 # an absolute path.
 outputdir="${PWD}/regression-test-output-$(date +%Y-%m-%d_%Hh%Mm%Ss)"
 # Driver configuration.
-mpt_scst="false"
 multiple_patches="false"
 qla2x00t="true"
 remove_temporary_files_at_end="false"

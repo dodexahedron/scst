@@ -16,6 +16,8 @@
  *  GNU General Public License for more details.
  */
 
+#include <linux/version.h>
+#include <linux/aio.h>		/* struct kiocb for kernel v4.0 */
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/errno.h>
@@ -30,7 +32,9 @@
 #include <linux/ctype.h>
 #include <linux/delay.h>
 #include <linux/vmalloc.h>
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 4, 0)
 #include <asm/kmap_types.h>
+#endif
 #include <asm/unaligned.h>
 #include <asm/checksum.h>
 #ifndef INSIDE_KERNEL_TREE
@@ -491,6 +495,8 @@ static int get_cdb_info_mo(struct scst_cmd *cmd,
 	const struct scst_sdbops *sdbops);
 static int get_cdb_info_var_len(struct scst_cmd *cmd,
 	const struct scst_sdbops *sdbops);
+static int get_cdb_info_dyn_runtime_attr(struct scst_cmd *cmd,
+	const struct scst_sdbops *sdbops);
 
 /*
  * +=====================================-============-======-
@@ -544,6 +550,8 @@ struct scst_sdbops {
 				 * target <--> init: SCST_DATA_READ|
 				 *		     SCST_DATA_WRITE
 				 */
+	/* If not zero, logarithm base 2 of the maximum data buffer length. */
+	uint8_t log2_max_buf_len;
 	uint32_t info_op_flags;	/* various flags of this opcode */
 	const char *info_op_name;/* op code SCSI full name */
 	int (*get_cdb_info)(struct scst_cmd *cmd, const struct scst_sdbops *sdbops);
@@ -870,6 +878,7 @@ static const struct scst_sdbops scst_scsi_op_table[] = {
 	 .info_data_direction = SCST_DATA_READ,
 	 .info_op_flags = SCST_IMPLICIT_HQ|SCST_REG_RESERVE_ALLOWED|
 		SCST_WRITE_EXCL_ALLOWED|SCST_EXCL_ACCESS_ALLOWED,
+	 .log2_max_buf_len = 3,
 	 .get_cdb_info = get_cdb_info_read_capacity},
 	{.ops = 0x25, .devkey = "      O         ",
 	 .info_op_name = "GET WINDOW",
@@ -1653,7 +1662,7 @@ static const struct scst_sdbops scst_scsi_op_table[] = {
 	 .info_len_off = 6, .info_len_len = 4,
 	 .get_cdb_info = get_cdb_info_len_4},
 	{.ops = 0xBF, .devkey = "     O          ",
-	 .info_op_name = "SEND DVD STRUCTUE",
+	 .info_op_name = "SEND DVD STRUCTURE",
 	 .info_data_direction = SCST_DATA_WRITE,
 	 .info_op_flags = FLAG_NONE,
 	 .info_len_off = 8, .info_len_len = 4,
@@ -1664,6 +1673,18 @@ static const struct scst_sdbops scst_scsi_op_table[] = {
 	 .info_op_flags = FLAG_NONE,
 	 .info_len_off = 6, .info_len_len = 4,
 	 .get_cdb_info = get_cdb_info_len_4},
+	{.ops = 0xD1, .devkey = " O              ",
+	 .info_op_name = "READ DYN RUNTIME ATTR",
+	 .info_data_direction = SCST_DATA_READ,
+	 .info_op_flags = FLAG_NONE,
+	 .info_len_off = 6, .info_len_len = 4,
+	 .get_cdb_info = get_cdb_info_dyn_runtime_attr},
+	{.ops = 0xD2, .devkey = " O              ",
+	 .info_op_name = "WRITE DYN RUNTIME ATTR",
+	 .info_data_direction = SCST_DATA_WRITE,
+	 .info_op_flags = FLAG_NONE,
+	 .info_len_off = 6, .info_len_len = 4,
+	 .get_cdb_info = get_cdb_info_dyn_runtime_attr},
 	{.ops = 0xE7, .devkey = "        V       ",
 	 .info_op_name = "INIT ELEMENT STATUS WRANGE",
 	 .info_data_direction = SCST_DATA_NONE,
@@ -5820,7 +5841,7 @@ struct scst_cmd *__scst_create_prepare_internal_cmd(const uint8_t *cdb,
 	}
 
 	scst_sess_get(res->sess);
-	res->cpu_cmd_counter = scst_get();
+	scst_get_icmd(res);
 
 	TRACE(TRACE_SCSI, "New internal cmd %p (op %s)", res,
 		scst_get_opcode_name(res));
@@ -5987,6 +6008,7 @@ static void scst_complete_request_sense(struct scst_cmd *req_cmd)
 	return;
 }
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 19, 0)
 static int scst_cmp_fs_ds(void)
 {
 	mm_segment_t fs = get_fs();
@@ -5994,118 +6016,167 @@ static int scst_cmp_fs_ds(void)
 
 	return memcmp(&fs, &ds, sizeof(fs));
 }
+#endif
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3, 9, 0) && !defined(RHEL_MAJOR)
 ssize_t kernel_write(struct file *file, const void *buf, size_t count,
 		     loff_t *pos)
 {
-	mm_segment_t old_fs = get_fs();
-	ssize_t result;
-	set_fs(KERNEL_DS);
-	{
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
-	struct iovec iov = {
-		.iov_base = (void __force __user *)buf,
+	struct kvec iov = {
+		.iov_base = buf,
 		.iov_len = count
 	};
 
-	result = scst_writev(file, &iov, 1, pos);
-#else
-	result = vfs_write(file, (void __force __user *)buf, count, pos);
-#endif
-	}
-	set_fs(old_fs);
-
-	return result;
+	return scst_writev(file, &iov, 1, pos);
 }
 EXPORT_SYMBOL(kernel_write);
 #endif
 
-ssize_t scst_readv(struct file *file, const struct iovec *vec,
+/**
+ * scst_file_size - returns the size of a regular file
+ * @path: Path of the file.
+ * @mode: If not NULL, the file mode will be stored in *@mode.
+ *
+ * Returns the file size or an error code.
+ */
+loff_t scst_file_size(const char *path, umode_t *mode)
+{
+	struct file *filp;
+	struct inode *inode;
+	loff_t res;
+
+	filp = filp_open(path, O_LARGEFILE | O_RDONLY, 0600);
+	if (IS_ERR(filp))
+		return PTR_ERR(filp);
+	inode = file_inode(filp);
+	if (mode)
+		*mode = inode->i_mode;
+	res = S_ISREG(inode->i_mode) ? i_size_read(file_inode(filp)) : -ENOTTY;
+	filp_close(filp, NULL);
+	return res;
+}
+EXPORT_SYMBOL(scst_file_size);
+
+/**
+ * scst_bdev_size - returns the size of a block device
+ * @path: Path of the block device.
+ *
+ * Returns the block device size or an error code.
+ */
+loff_t scst_bdev_size(const char *path)
+{
+	struct block_device *bdev;
+	loff_t res;
+
+	bdev = blkdev_get_by_path(path, FMODE_READ, (void *)__func__);
+	if (IS_ERR(bdev))
+		return PTR_ERR(bdev);
+	res = i_size_read(bdev->bd_inode);
+	blkdev_put(bdev, FMODE_READ);
+	return res;
+}
+EXPORT_SYMBOL(scst_bdev_size);
+
+loff_t scst_file_or_bdev_size(const char *path)
+{
+	enum { INVALID_FILE_MODE = 0 };
+	umode_t mode = INVALID_FILE_MODE;
+	loff_t res;
+
+	res = scst_file_size(path, &mode);
+	if (S_ISREG(mode))
+		return res;
+	if (mode != INVALID_FILE_MODE && !S_ISBLK(mode))
+		return -EINVAL;
+	return scst_bdev_size(path);
+}
+EXPORT_SYMBOL(scst_file_or_bdev_size);
+
+/**
+ * scst_readv - read data from a file into a kernel buffer
+ * @file: File to read from.
+ * @vec:  Pointer to first element of struct kvec array.
+ * @vlen: Number of elements of the kvec array.
+ * @pos:  Position in @file where to start reading.
+ */
+ssize_t scst_readv(struct file *file, const struct kvec *vec,
 		   unsigned long vlen, loff_t *pos)
 {
-	mm_segment_t old_fs = get_fs();
 	ssize_t result;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
-	struct iovec iovstack[UIO_FASTIOV];
-	struct iovec *iov = iovstack;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0)
 	struct iov_iter iter;
+	struct kiocb kiocb;
+	size_t count = 0;
+	int i;
 
-	set_fs(KERNEL_DS);
-	WARN_ON_ONCE(scst_cmp_fs_ds() != 0);
-
-	result = import_iovec(READ, (const struct iovec __force __user *)vec,
-			      vlen, ARRAY_SIZE(iovstack), &iov, &iter);
-	if (result >= 0) {
-		result = vfs_iter_read(file, &iter, pos, 0);
-		BUG_ON(iov == iovstack);
-		kfree(iov);
-	}
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 6, 0) ||	\
-	(defined(CONFIG_SUSE_KERNEL) &&			\
-	LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0))
-	set_fs(KERNEL_DS);
-	WARN_ON_ONCE(scst_cmp_fs_ds() != 0);
-
-	result = vfs_readv(file, (const struct iovec __user *)vec, vlen, pos,
-			   0);
+	init_sync_kiocb(&kiocb, file);
+	kiocb.ki_pos = *pos;
+	for (i = 0; i < vlen; i++)
+		count += vec[i].iov_len;
+	iov_iter_kvec(&iter, READ, vec, vlen, count);
+	result = call_read_iter(file, &kiocb, &iter);
+	sBUG_ON(result == -EIOCBQUEUED);
+	if (result > 0)
+		*pos += result;
 #else
+	mm_segment_t old_fs = get_fs();
+
 	set_fs(KERNEL_DS);
 	WARN_ON_ONCE(scst_cmp_fs_ds() != 0);
-
+	BUILD_BUG_ON(sizeof(struct kvec) != sizeof(struct iovec));
+	BUILD_BUG_ON(offsetof(struct kvec, iov_base) !=
+		     offsetof(struct iovec, iov_base));
+	BUILD_BUG_ON(offsetof(struct kvec, iov_len) !=
+		     offsetof(struct iovec, iov_len));
 	result = vfs_readv(file, (const struct iovec __user *)vec, vlen, pos);
-#endif
 	set_fs(old_fs);
+#endif
 
 	return result;
 }
 EXPORT_SYMBOL(scst_readv);
 
 /**
- * scst_writev - write a buffer to a file
+ * scst_writev - write kernel data to a file
  * @file: File to write to.
- * @vec:  Pointer to first element of struct iovec array.
- * @vlen: Number of elements of the iovec array.
+ * @vec:  Pointer to first element of struct kvec array.
+ * @vlen: Number of elements of the kvec array.
  * @pos:  Position in @file where to start writing.
- *
- * Note: although @vec->iov_base has type void __user*, it points at kernel
- * data and not at data in user space.
  */
-ssize_t scst_writev(struct file *file, const struct iovec *vec,
+ssize_t scst_writev(struct file *file, const struct kvec *vec,
 		    unsigned long vlen, loff_t *pos)
 {
-	mm_segment_t old_fs = get_fs();
 	ssize_t result;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
-	struct iovec iovstack[UIO_FASTIOV];
-	struct iovec *iov = iovstack;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0)
 	struct iov_iter iter;
+	struct kiocb kiocb;
+	size_t count = 0;
+	int i;
 
-	set_fs(KERNEL_DS);
-	WARN_ON_ONCE(scst_cmp_fs_ds() != 0);
-
-	result = import_iovec(WRITE, (const struct iovec __force __user *)vec,
-			      vlen, ARRAY_SIZE(iovstack), &iov, &iter);
-	if (result >= 0) {
-		file_start_write(file);
-		result = vfs_iter_write(file, &iter, pos, 0);
-		file_end_write(file);
-		BUG_ON(iov == iovstack);
-		kfree(iov);
-	}
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 6, 0) ||	\
-	(defined(CONFIG_SUSE_KERNEL) &&			\
-	LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0))
-	set_fs(KERNEL_DS);
-	WARN_ON_ONCE(scst_cmp_fs_ds() != 0);
-	result = vfs_writev(file, (const struct iovec __user *)vec, vlen, pos,
-			    0);
+	init_sync_kiocb(&kiocb, file);
+	kiocb.ki_pos = *pos;
+	for (i = 0; i < vlen; i++)
+		count += vec[i].iov_len;
+	iov_iter_kvec(&iter, WRITE, vec, vlen, count);
+	file_start_write(file);
+	result = call_write_iter(file, &kiocb, &iter);
+	file_end_write(file);
+	sBUG_ON(result == -EIOCBQUEUED);
+	if (result > 0)
+		*pos += result;
 #else
+	mm_segment_t old_fs = get_fs();
+
 	set_fs(KERNEL_DS);
 	WARN_ON_ONCE(scst_cmp_fs_ds() != 0);
+	BUILD_BUG_ON(sizeof(struct kvec) != sizeof(struct iovec));
+	BUILD_BUG_ON(offsetof(struct kvec, iov_base) !=
+		     offsetof(struct iovec, iov_base));
+	BUILD_BUG_ON(offsetof(struct kvec, iov_len) !=
+		     offsetof(struct iovec, iov_len));
 	result = vfs_writev(file, (const struct iovec __user *)vec, vlen, pos);
-#endif
 	set_fs(old_fs);
+#endif
 
 	return result;
 }
@@ -7173,7 +7244,13 @@ struct scst_session *scst_alloc_session(struct scst_tgt *tgt, gfp_t gfp_mask,
 	}
 
 	if (atomic_read(&scst_measure_latency)) {
-		sess->lat_stats = vzalloc(sizeof(*sess->lat_stats));
+		/*
+		 * To do: remove higher order allocation from the code below
+		 * for the GFP_ATOMIC case.
+		 */
+		sess->lat_stats = gfp_mask & GFP_ATOMIC ?
+			kzalloc(sizeof(*sess->lat_stats), gfp_mask) :
+			vzalloc(sizeof(*sess->lat_stats));
 		if (!sess->lat_stats)
 			goto out_free_name;
 	}
@@ -7232,7 +7309,7 @@ void scst_free_session(struct scst_session *sess)
 	mutex_unlock(&scst_mutex);
 
 	kfree(sess->transport_id);
-	vfree(sess->lat_stats);
+	kvfree(sess->lat_stats);
 	kfree(sess->initiator_name);
 	if (sess->sess_name != sess->initiator_name)
 		kfree(sess->sess_name);
@@ -7474,10 +7551,8 @@ static void scst_destroy_cmd(struct scst_cmd *cmd)
 
 	scst_sess_put(cmd->sess);
 
-	if (likely(cmd->cpu_cmd_counter)) {
-		scst_put(cmd->cpu_cmd_counter);
-		cmd->cpu_cmd_counter = NULL;
-	}
+	if (likely(cmd->counted))
+		scst_put_cmd(cmd);
 
 	EXTRACHECKS_BUG_ON(cmd->pre_alloced && cmd->internal);
 
@@ -7717,10 +7792,8 @@ void scst_free_mgmt_cmd(struct scst_mgmt_cmd *mcmd)
 
 	scst_sess_put(mcmd->sess);
 
-	if (mcmd->cpu_cmd_counter) {
-		scst_put(mcmd->cpu_cmd_counter);
-		mcmd->cpu_cmd_counter = NULL;
-	}
+	if (mcmd->counted)
+		scst_put_mcmd(mcmd);
 
 	mempool_free(mcmd, scst_mgmt_mempool);
 
@@ -8183,7 +8256,7 @@ static struct request *blk_make_request(struct request_queue *q,
 			return ERR_PTR(ret);
 		}
 		/*
-		 * See also commit commit 0abc2a10389f ("block: fix
+		 * See also commit 0abc2a10389f ("block: fix
 		 * blk_rq_append_bio"). That commit has been backported to
 		 * kernel v4.14.11 as 88da02868f77.
 		 */
@@ -11143,6 +11216,7 @@ static int get_cdb_info_serv_act_in(struct scst_cmd *cmd,
 				SCST_REG_RESERVE_ALLOWED |
 				SCST_WRITE_EXCL_ALLOWED |
 				SCST_EXCL_ACCESS_ALLOWED;
+		cmd->log2_max_buf_len = 7;
 		break;
 	case SAI_GET_LBA_STATUS:
 		cmd->op_name = "GET LBA STATUS";
@@ -11728,6 +11802,16 @@ static int get_cdb_info_write_same32(struct scst_cmd *cmd,
 	return get_cdb_info_write_same(cmd, sdbops, cmd->cdb[10] & 1 /*NDOB*/);
 }
 
+static int get_cdb_info_dyn_runtime_attr(struct scst_cmd *cmd,
+	const struct scst_sdbops *sdbops)
+{
+	/*
+	 * Read/write dyn runtime attr commands are non-standard, CDB len is 12
+	 */
+	cmd->cdb_len = 12;
+	return get_cdb_info_len_4(cmd, sdbops);
+}
+
 /**
  * scst_set_cmd_from_cdb_info() - Parse the SCSI CDB.
  * @cmd: SCSI command to parse.
@@ -11738,6 +11822,8 @@ static int get_cdb_info_write_same32(struct scst_cmd *cmd,
 static int scst_set_cmd_from_cdb_info(struct scst_cmd *cmd,
 	const struct scst_sdbops *ptr)
 {
+	int res;
+
 	cmd->cdb_len = SCST_GET_CDB_LEN(cmd->cdb[0]);
 	cmd->cmd_naca = (cmd->cdb[cmd->cdb_len - 1] & CONTROL_BYTE_NACA_BIT);
 	cmd->cmd_linked = (cmd->cdb[cmd->cdb_len - 1] & CONTROL_BYTE_LINK_BIT);
@@ -11748,7 +11834,16 @@ static int scst_set_cmd_from_cdb_info(struct scst_cmd *cmd,
 	cmd->lba_len = ptr->info_lba_len;
 	cmd->len_off = ptr->info_len_off;
 	cmd->len_len = ptr->info_len_len;
-	return (*ptr->get_cdb_info)(cmd, ptr);
+	cmd->log2_max_buf_len = ptr->log2_max_buf_len;
+	res = (*ptr->get_cdb_info)(cmd, ptr);
+	if (!cmd->log2_max_buf_len ||
+	    cmd->bufflen <= (1U << cmd->log2_max_buf_len))
+		return res;
+	PRINT_ERROR("Data buffer length %d is too big for SCSI command %s (max %d)",
+		    cmd->bufflen, scst_get_opcode_name(cmd),
+		    1U << cmd->log2_max_buf_len);
+	scst_set_invalid_field_in_cdb(cmd, cmd->len_off, 0);
+	return 1;
 }
 
 static int get_cdb_info_var_len(struct scst_cmd *cmd,
@@ -12361,21 +12456,20 @@ int scst_tape_generic_parse(struct scst_cmd *cmd)
 	 */
 
 	if (cmd->op_flags & SCST_TRANSFER_LEN_TYPE_FIXED && cmd->cdb[1] & 1) {
-		int block_size = cmd->dev->block_size;
-		uint64_t b, ob;
-		bool overflow;
+		uint32_t block_size = cmd->dev->block_size;
+		uint32_t block_shift = cmd->dev->block_shift;
+		bool overflow = shift_left_overflows(cmd->bufflen, block_shift) ||
+				shift_left_overflows(cmd->data_len, block_shift) ||
+				shift_left_overflows(cmd->out_bufflen, block_shift);
 
-		b = ((uint64_t)cmd->bufflen) * block_size;
-		ob = ((uint64_t)cmd->out_bufflen) * block_size;
-
-		overflow = (b > 0xFFFFFFFF) ||
-			   (ob > 0xFFFFFFFF);
+		BUILD_BUG_ON(sizeof(cmd->bufflen) != 4);
+		BUILD_BUG_ON(sizeof(cmd->out_bufflen) != 4);
 		if (unlikely(overflow)) {
 			PRINT_WARNING("bufflen %u, data_len %llu or out_bufflen"
 				      " %u too large for device %s (block size"
-				      " %u, b %llu, ob %llu)", cmd->bufflen,
+				      " %u)", cmd->bufflen,
 				      cmd->data_len, cmd->out_bufflen,
-				      cmd->dev->virt_name, block_size, b, ob);
+				      cmd->dev->virt_name, block_size);
 			PRINT_BUFFER("CDB", cmd->cdb, cmd->cdb_len);
 			scst_set_cmd_error(cmd, SCST_LOAD_SENSE(
 					scst_sense_block_out_range_error));
@@ -12383,12 +12477,9 @@ int scst_tape_generic_parse(struct scst_cmd *cmd)
 			goto out;
 		}
 
-		cmd->bufflen = b;
-		cmd->out_bufflen = ob;
-
-		/* cmd->data_len is 64-bit, so can't overflow here */
-		BUILD_BUG_ON(sizeof(cmd->data_len) < 8);
-		cmd->data_len *= block_size;
+		cmd->bufflen <<= block_shift;
+		cmd->out_bufflen <<= block_shift;
+		cmd->data_len <<= block_shift;
 	}
 
 	if ((cmd->op_flags & (SCST_SMALL_TIMEOUT | SCST_LONG_TIMEOUT)) == 0)
@@ -15090,7 +15181,7 @@ out_unlock:
 
 /* Abstract vfs_unlink() for different kernel versions (as possible) */
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 39)
-void scst_vfs_unlink_and_put(struct nameidata *nd)
+void scst_vfs_unlink_and_put_nd(struct nameidata *nd)
 {
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 25)
 	vfs_unlink(nd->dentry->d_parent->d_inode, nd->dentry);
@@ -15102,7 +15193,8 @@ void scst_vfs_unlink_and_put(struct nameidata *nd)
 	path_put(&nd->path);
 #endif
 }
-#else
+#endif
+
 void scst_vfs_unlink_and_put(struct path *path)
 {
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3, 13, 0) && \
@@ -15115,7 +15207,6 @@ void scst_vfs_unlink_and_put(struct path *path)
 #endif
 	path_put(path);
 }
-#endif
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 39)
 void scst_path_put(struct nameidata *nd)
@@ -15133,7 +15224,6 @@ EXPORT_SYMBOL(scst_path_put);
 int scst_copy_file(const char *src, const char *dest)
 {
 	int res = 0;
-	struct inode *inode;
 	loff_t file_size, pos;
 	uint8_t *buf = NULL;
 	struct file *file_src = NULL, *file_dest = NULL;
@@ -15149,6 +15239,12 @@ int scst_copy_file(const char *src, const char *dest)
 
 	TRACE_DBG("Copying '%s' into '%s'", src, dest);
 
+	file_size = scst_file_or_bdev_size(src);
+	if (file_size < 0) {
+		res = file_size;
+		goto out;
+	}
+
 	file_src = filp_open(src, O_RDONLY, 0);
 	if (IS_ERR(file_src)) {
 		res = PTR_ERR(file_src);
@@ -15163,20 +15259,6 @@ int scst_copy_file(const char *src, const char *dest)
 			res);
 		goto out_close;
 	}
-
-	inode = file_inode(file_src);
-
-	if (S_ISREG(inode->i_mode)) {
-		/* Nothing to do */
-	} else if (S_ISBLK(inode->i_mode)) {
-		inode = inode->i_bdev->bd_inode;
-	} else {
-		PRINT_ERROR("Invalid file mode 0x%x", inode->i_mode);
-		res = -EINVAL;
-		goto out_skip;
-	}
-
-	file_size = inode->i_size;
 
 	buf = vmalloc(file_size);
 	if (buf == NULL) {
@@ -15223,21 +15305,18 @@ out:
 int scst_remove_file(const char *name)
 {
 	int res = 0;
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 39)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 28)
 	struct nameidata nd;
 #else
 	struct path path;
 #endif
-	mm_segment_t old_fs = get_fs();
 
 	TRACE_ENTRY();
 
-	set_fs(KERNEL_DS);
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 39)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 28)
 	res = path_lookup(name, 0, &nd);
 	if (!res)
-		scst_vfs_unlink_and_put(&nd);
+		scst_vfs_unlink_and_put_nd(&nd);
 	else
 		TRACE_DBG("Unable to lookup file '%s' - error %d", name, res);
 #else
@@ -15247,8 +15326,6 @@ int scst_remove_file(const char *name)
 	else
 		TRACE_DBG("Unable to lookup file '%s' - error %d", name, res);
 #endif
-
-	set_fs(old_fs);
 
 	TRACE_EXIT_RES(res);
 	return res;
@@ -15337,12 +15414,17 @@ static int __scst_read_file_transactional(const char *file_name,
 {
 	int res;
 	struct file *file = NULL;
-	struct inode *inode;
 	loff_t file_size, pos;
 
 	TRACE_ENTRY();
 
 	TRACE_DBG("Loading file '%s'", file_name);
+
+	file_size = scst_file_or_bdev_size(file_name);
+	if (file_size < 0) {
+		res = file_size;
+		goto out;
+	}
 
 	file = filp_open(file_name, O_RDONLY, 0);
 	if (IS_ERR(file)) {
@@ -15350,20 +15432,6 @@ static int __scst_read_file_transactional(const char *file_name,
 		TRACE_DBG("Unable to open file '%s' - error %d", file_name, res);
 		goto out;
 	}
-
-	inode = file_inode(file);
-
-	if (S_ISREG(inode->i_mode)) {
-		/* Nothing to do */
-	} else if (S_ISBLK(inode->i_mode)) {
-		inode = inode->i_bdev->bd_inode;
-	} else {
-		PRINT_ERROR("Invalid file mode 0x%x", inode->i_mode);
-		res = -EINVAL;
-		goto out_close;
-	}
-
-	file_size = inode->i_size;
 
 	if (file_size > size) {
 		PRINT_ERROR("Supplied buffer (%d) too small (need %d)", size,

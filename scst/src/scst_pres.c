@@ -660,7 +660,6 @@ static int scst_pr_do_load_device_file(struct scst_device *dev,
 {
 	int res = 0, rc;
 	struct file *file = NULL;
-	struct inode *inode;
 	char *buf = NULL;
 	loff_t file_size, pos, data_size;
 	uint64_t sign, version;
@@ -676,25 +675,18 @@ static int scst_pr_do_load_device_file(struct scst_device *dev,
 
 	TRACE_PR("Loading persistent file '%s'", file_name);
 
+	file_size = scst_file_or_bdev_size(file_name);
+	if (file_size < 0) {
+		res = file_size;
+		goto out;
+	}
+
 	file = filp_open(file_name, O_RDONLY, 0);
 	if (IS_ERR(file)) {
 		res = PTR_ERR(file);
 		TRACE_PR("Unable to open file '%s' - error %d", file_name, res);
 		goto out;
 	}
-
-	inode = file_inode(file);
-
-	if (S_ISREG(inode->i_mode)) {
-		/* Nothing to do */
-	} else if (S_ISBLK(inode->i_mode)) {
-		inode = inode->i_bdev->bd_inode;
-	} else {
-		PRINT_ERROR("Invalid file mode 0x%x", inode->i_mode);
-		goto out_close;
-	}
-
-	file_size = inode->i_size;
 
 	/* Let's limit the file size by some reasonable number */
 	if ((file_size == 0) || (file_size >= 15*1024*1024)) {
@@ -795,7 +787,7 @@ static int scst_pr_do_load_device_file(struct scst_device *dev,
 		tid = &buf[pos];
 		pos += scst_tid_size(tid);
 
-		key = get_unaligned_be64(&buf[pos]);
+		key = get_unaligned((__be64 *)&buf[pos]);
 		pos += sizeof(key);
 
 		rel_tgt_id = get_unaligned((uint16_t *)&buf[pos]);
@@ -1017,14 +1009,14 @@ write_error:
 
 write_error_close:
 	filp_close(file, NULL);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 39)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 28)
 	{
 		struct nameidata nd;
 		int rc;
 
 		rc = path_lookup(dev->pr_file_name, 0,	&nd);
 		if (!rc)
-			scst_vfs_unlink_and_put(&nd);
+			scst_vfs_unlink_and_put_nd(&nd);
 		else
 			TRACE_PR("Unable to lookup '%s' - error %d",
 				dev->pr_file_name, rc);
@@ -1167,7 +1159,7 @@ int scst_pr_set_cluster_mode(struct scst_device *dev, bool cluster_mode,
 
 out:
 #else
-	res = cluster_mode ? -ENOTSUPP : 0;
+	res = cluster_mode ? -EOPNOTSUPP : 0;
 #endif
 
 	return res;
@@ -1294,7 +1286,7 @@ static int scst_pr_register_with_spec_i_pt(struct scst_cmd *cmd,
 
 	scst_assert_pr_mutex_held(cmd->dev);
 
-	action_key = get_unaligned_be64(&buffer[8]);
+	action_key = get_unaligned((__be64 *)&buffer[8]);
 
 	ext_size = get_unaligned_be32(&buffer[24]);
 	if ((ext_size + 28) > buffer_size) {
@@ -1505,7 +1497,7 @@ static int scst_pr_register_on_tgt_id(struct scst_cmd *cmd,
 		__be64 action_key;
 		struct scst_dev_registrant *reg;
 
-		action_key = get_unaligned_be64(&buffer[8]);
+		action_key = get_unaligned((__be64 *)&buffer[8]);
 
 		reg = scst_pr_add_registrant(cmd->dev, cmd->sess->transport_id,
 			rel_tgt_id, action_key, false);
@@ -1680,8 +1672,8 @@ void scst_pr_register(struct scst_cmd *cmd, uint8_t *buffer, int buffer_size)
 	aptpl = buffer[20] & 0x01;
 	spec_i_pt = (buffer[20] >> 3) & 0x01;
 	all_tg_pt = (buffer[20] >> 2) & 0x01;
-	key = get_unaligned_be64(&buffer[0]);
-	action_key = get_unaligned_be64(&buffer[8]);
+	key = get_unaligned((__be64 *)&buffer[0]);
+	action_key = get_unaligned((__be64 *)&buffer[8]);
 
 	if (spec_i_pt == 0 && buffer_size != 24) {
 		TRACE_PR("Invalid buffer size %d", buffer_size);
@@ -1767,7 +1759,7 @@ void scst_pr_register_and_ignore(struct scst_cmd *cmd, uint8_t *buffer,
 
 	aptpl = buffer[20] & 0x01;
 	all_tg_pt = (buffer[20] >> 2) & 0x01;
-	action_key = get_unaligned_be64(&buffer[8]);
+	action_key = get_unaligned((__be64 *)&buffer[8]);
 
 	if (buffer_size != 24) {
 		TRACE_PR("Invalid buffer size %d", buffer_size);
@@ -1838,8 +1830,8 @@ void scst_pr_register_and_move(struct scst_cmd *cmd, uint8_t *buffer,
 	scst_assert_pr_mutex_held(cmd->dev);
 
 	aptpl = buffer[17] & 0x01;
-	key = get_unaligned_be64(&buffer[0]);
-	action_key = get_unaligned_be64(&buffer[8]);
+	key = get_unaligned((__be64 *)&buffer[0]);
+	action_key = get_unaligned((__be64 *)&buffer[8]);
 	unreg = (buffer[17] >> 1) & 0x01;
 	tid_buffer_size = get_unaligned_be32(&buffer[20]);
 
@@ -1980,7 +1972,7 @@ void scst_pr_reserve(struct scst_cmd *cmd, uint8_t *buffer, int buffer_size)
 
 	scst_assert_pr_mutex_held(dev);
 
-	key = get_unaligned_be64(&buffer[0]);
+	key = get_unaligned((__be64 *)&buffer[0]);
 	scope = cmd->cdb[2] >> 4;
 	type = cmd->cdb[2] & 0x0f;
 
@@ -2069,7 +2061,7 @@ void scst_pr_release(struct scst_cmd *cmd, uint8_t *buffer, int buffer_size)
 
 	scst_assert_pr_mutex_held(dev);
 
-	key = get_unaligned_be64(&buffer[0]);
+	key = get_unaligned((__be64 *)&buffer[0]);
 	scope = cmd->cdb[2] >> 4;
 	type = cmd->cdb[2] & 0x0f;
 
@@ -2146,7 +2138,7 @@ void scst_pr_clear(struct scst_cmd *cmd, uint8_t *buffer, int buffer_size)
 
 	scst_assert_pr_mutex_held(dev);
 
-	key = get_unaligned_be64(&buffer[0]);
+	key = get_unaligned((__be64 *)&buffer[0]);
 
 	if (buffer_size != 24) {
 		TRACE_PR("Invalid buffer size %d", buffer_size);
@@ -2207,8 +2199,8 @@ static void scst_pr_do_preempt(struct scst_cmd *cmd, uint8_t *buffer,
 		goto out;
 	}
 
-	key = get_unaligned_be64(&buffer[0]);
-	action_key = get_unaligned_be64(&buffer[8]);
+	key = get_unaligned((__be64 *)&buffer[0]);
+	action_key = get_unaligned((__be64 *)&buffer[8]);
 	scope = cmd->cdb[2] >> 4;
 	type = cmd->cdb[2] & 0x0f;
 
@@ -2598,7 +2590,8 @@ void scst_pr_read_keys(struct scst_cmd *cmd, uint8_t *buffer, int buffer_size)
 
 			WARN_ON(reg->key == 0);
 
-			put_unaligned_be64(reg->key, &buffer[offset]);
+			put_unaligned(reg->key,
+				(__be64 *)&buffer[offset]);
 
 			offset += 8;
 		}
@@ -2655,7 +2648,7 @@ void scst_pr_read_reservation(struct scst_cmd *cmd, uint8_t *buffer,
 		b[6] = 0;
 		b[7] = 0x10;
 
-		put_unaligned_be64(key, &b[8]);
+		put_unaligned(key, (__be64 *)&b[8]);
 		b[21] = dev->pr_scope << 4 | dev->pr_type;
 
 		size = 24;
@@ -2743,7 +2736,7 @@ void scst_pr_read_full_status(struct scst_cmd *cmd, uint8_t *buffer,
 		if (size_max - size > rec_len) {
 			memset(&buffer[offset], 0, rec_len);
 
-			put_unaligned_be64(reg->key, &buffer[offset]);
+			put_unaligned(reg->key, (__be64 *)(&buffer[offset]));
 
 			if (dev->pr_is_set && scst_pr_is_holder(dev, reg)) {
 				buffer[offset + 12] = 1;

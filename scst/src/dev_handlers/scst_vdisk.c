@@ -6,7 +6,7 @@
  *  Copyright (C) 2007 Ming Zhang <blackmagic02881 at gmail dot com>
  *  Copyright (C) 2007 Ross Walker <rswwalker at hotmail dot com>
  *  Copyright (C) 2007 - 2018 Western Digital Corporation
- *  Copyright (C) 2008 - 2018 Bart Van Assche <bvanassche@acm.org>
+ *  Copyright (C) 2008 - 2020 Bart Van Assche <bvanassche@acm.org>
  *
  *  SCSI disk (type 0) and CDROM (type 5) dev handler using files
  *  on file systems or block devices (VDISK)
@@ -76,7 +76,7 @@
 #define SCST_FIO_VENDOR			"SCST_FIO"
 #define SCST_BIO_VENDOR			"SCST_BIO"
 /* 4 byte ASCII Product Revision Level - left aligned */
-#define SCST_FIO_REV			"350 "
+#define SCST_FIO_REV			"360 "
 
 #define MAX_USN_LEN			(20+1) /* For '\0' */
 #define MAX_INQ_VEND_SPECIFIC_LEN	(INQ_BUF_SZ - 96)
@@ -191,6 +191,7 @@ struct scst_vdisk_dev {
 	struct file *fd;
 	struct file *dif_fd;
 	struct block_device *bdev;
+	fmode_t bdev_mode;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 30)
 	struct bio_set *vdisk_bioset;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 18, 0)
@@ -257,9 +258,9 @@ struct scst_vdisk_dev {
 struct vdisk_cmd_params {
 	union {
 		struct {
-			struct iovec *iv;
-			int iv_count;
-			struct iovec small_iv[4];
+			struct kvec	*kvec;
+			int		kvec_segs;
+			struct kvec	small_kvec[4];
 		} sync;
 		struct {
 			struct kiocb	iocb;
@@ -514,41 +515,34 @@ out:
 
 static void vdisk_blockio_check_flush_support(struct scst_vdisk_dev *virt_dev)
 {
-	struct inode *inode;
-	struct file *fd;
+	struct block_device *bdev;
 
 	TRACE_ENTRY();
 
-	if (!virt_dev->blockio || virt_dev->rd_only || virt_dev->nv_cache || virt_dev->wt_flag || !virt_dev->dev_active)
+	if (!virt_dev->blockio || virt_dev->rd_only || virt_dev->nv_cache ||
+	    virt_dev->wt_flag || !virt_dev->dev_active)
 		goto out;
 
-	fd = filp_open(virt_dev->filename, O_LARGEFILE, 0600);
-	if (IS_ERR(fd)) {
-		if ((PTR_ERR(fd) == -EMEDIUMTYPE) && virt_dev->blockio)
+	bdev = blkdev_get_by_path(virt_dev->filename, FMODE_READ,
+				  (void *)__func__);
+	if (IS_ERR(bdev)) {
+		if (PTR_ERR(bdev) == -EMEDIUMTYPE)
 			TRACE(TRACE_MINOR, "Unable to open %s with EMEDIUMTYPE, "
 				"DRBD passive?", virt_dev->filename);
 		else
-			PRINT_ERROR("filp_open(%s) failed: %ld",
-				virt_dev->filename, PTR_ERR(fd));
+			PRINT_ERROR("blkdev_get_by_path(%s) failed: %ld",
+				virt_dev->filename, PTR_ERR(bdev));
 		goto out;
 	}
 
-	inode = file_inode(fd);
-
-	if (!S_ISBLK(inode->i_mode)) {
-		PRINT_ERROR("%s is NOT a block device", virt_dev->filename);
-		goto out_close;
-	}
-
-	if (vdisk_blockio_flush(inode->i_bdev, GFP_KERNEL, false, NULL, false) != 0) {
+	if (vdisk_blockio_flush(bdev, GFP_KERNEL, false, NULL, false) != 0) {
 		PRINT_WARNING("Device %s doesn't support barriers, switching "
 			"to NV_CACHE mode. Read README for more details.",
 			virt_dev->filename);
 		virt_dev->nv_cache = 1;
 	}
 
-out_close:
-	filp_close(fd, NULL);
+	blkdev_put(bdev, FMODE_READ);
 
 out:
 	TRACE_EXIT();
@@ -557,39 +551,44 @@ out:
 
 static void vdisk_check_tp_support(struct scst_vdisk_dev *virt_dev)
 {
+	struct block_device *bdev = NULL;
 	struct file *fd = NULL;
 	bool fd_open = false;
+	int res;
 
 	TRACE_ENTRY();
 
 	virt_dev->dev_thin_provisioned = 0;
 
-	if (virt_dev->rd_only || (virt_dev->filename == NULL) || !virt_dev->dev_active)
+	if (virt_dev->rd_only || !virt_dev->filename || !virt_dev->dev_active)
 		goto check;
 
-	fd = filp_open(virt_dev->filename, O_LARGEFILE, 0600);
-	if (IS_ERR(fd)) {
-		if ((PTR_ERR(fd) == -EMEDIUMTYPE) && virt_dev->blockio)
-			TRACE(TRACE_MINOR, "Unable to open %s with EMEDIUMTYPE, "
-				"DRBD passive?", virt_dev->filename);
+	if (virt_dev->blockio) {
+		bdev = blkdev_get_by_path(virt_dev->filename, FMODE_READ,
+					  (void *)__func__);
+		res = IS_ERR(bdev) ? PTR_ERR(bdev) : 0;
+	} else {
+		fd = filp_open(virt_dev->filename, O_LARGEFILE, 0600);
+		res = IS_ERR(fd) ? PTR_ERR(fd) : 0;
+	}
+	if (res) {
+		if (res == -EMEDIUMTYPE && virt_dev->blockio)
+			TRACE(TRACE_MINOR,
+			      "Unable to open %s with EMEDIUMTYPE, DRBD passive?",
+			      virt_dev->filename);
 		else
-			PRINT_ERROR("filp_open(%s) failed: %ld",
-				virt_dev->filename, PTR_ERR(fd));
+			PRINT_ERROR("opening %s failed: %d",
+				    virt_dev->filename, res);
 		goto check;
 	}
+
 	fd_open = true;
 
 	if (virt_dev->blockio) {
-		struct inode *inode = file_inode(fd);
-
-		if (!S_ISBLK(inode->i_mode)) {
-			PRINT_ERROR("%s is NOT a block device",
-				virt_dev->filename);
-			goto check;
-		}
-#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 32) || (defined(RHEL_MAJOR) && RHEL_MAJOR -0 >= 6)
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 32) ||	\
+	(defined(RHEL_MAJOR) && RHEL_MAJOR -0 >= 6)
 		virt_dev->dev_thin_provisioned =
-			blk_queue_discard(bdev_get_queue(inode->i_bdev));
+			blk_queue_discard(bdev_get_queue(bdev));
 #endif
 	} else {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 38)
@@ -633,7 +632,7 @@ check:
 			struct request_queue *q;
 
 			sBUG_ON(!fd_open);
-			q = bdev_get_queue(file_inode(fd)->i_bdev);
+			q = bdev_get_queue(bdev);
 			virt_dev->unmap_opt_gran = q->limits.discard_granularity >> block_shift;
 			virt_dev->unmap_align = q->limits.discard_alignment >> block_shift;
 			if (virt_dev->unmap_opt_gran == virt_dev->unmap_align)
@@ -666,8 +665,12 @@ check:
 			virt_dev->discard_zeroes_data);
 	}
 
-	if (fd_open)
-		filp_close(fd, NULL);
+	if (fd_open) {
+		if (virt_dev->blockio)
+			blkdev_put(bdev, FMODE_READ);
+		else
+			filp_close(fd, NULL);
+	}
 
 	TRACE_EXIT();
 	return;
@@ -677,56 +680,32 @@ check:
 static int vdisk_get_file_size(const struct scst_vdisk_dev *virt_dev,
 	loff_t *file_size)
 {
-	struct inode *inode;
-	int res = 0;
-	struct file *fd;
+	loff_t res;
 
 	TRACE_ENTRY();
 
 	sBUG_ON(!virt_dev->filename);
 
 	if (!virt_dev->dev_active) {
-		TRACE_DBG("Not active dev %s, skip reexaming", virt_dev->dev->virt_name);
+		TRACE_DBG("Not active dev %s, skip reexaming",
+			  virt_dev->dev->virt_name);
 		res = -EMEDIUMTYPE;
 		goto out;
 	}
 
-	*file_size = 0;
-
-	fd = filp_open(virt_dev->filename, O_LARGEFILE | O_RDONLY, 0600);
-	if (IS_ERR(fd)) {
-		res = PTR_ERR(fd);
-		if ((res == -EMEDIUMTYPE) && virt_dev->blockio)
-			TRACE(TRACE_MINOR, "Unable to open %s with EMEDIUMTYPE, "
-				"DRBD passive?", virt_dev->filename);
-		else
-			PRINT_ERROR("filp_open(%s) failed: %d", virt_dev->filename, res);
+	res = scst_file_or_bdev_size(virt_dev->filename);
+	if (res == -EMEDIUMTYPE && virt_dev->blockio) {
+		TRACE(TRACE_MINOR,
+		      "Unable to open %s with EMEDIUMTYPE, DRBD passive?",
+		      virt_dev->filename);
 		goto out;
 	}
-
-	inode = file_inode(fd);
-
-	if (virt_dev->blockio && !S_ISBLK(inode->i_mode)) {
-		PRINT_ERROR("File %s is NOT a block device", virt_dev->filename);
-		res = -EINVAL;
-		goto out_close;
+	if (res < 0) {
+		PRINT_ERROR("opening %s failed: %lld", virt_dev->filename, res);
+		goto out;
 	}
-
-	if (S_ISREG(inode->i_mode)) {
-		/* Nothing to do */
-	} else if (S_ISBLK(inode->i_mode)) {
-		inode = inode->i_bdev->bd_inode;
-	} else {
-		PRINT_ERROR("File %s unsupported mode: mode=0%o\n",
-			    virt_dev->filename, inode->i_mode);
-		res = -EINVAL;
-		goto out_close;
-	}
-
-	*file_size = inode->i_size;
-
-out_close:
-	filp_close(fd, NULL);
+	*file_size = res;
+	res = 0;
 
 out:
 	TRACE_EXIT_RES(res);
@@ -1006,28 +985,20 @@ static int vdisk_init_block_integrity(struct scst_vdisk_dev *virt_dev)
 {
 	int res;
 	struct scst_device *dev = virt_dev->dev;
-	struct inode *inode;
-	struct file *fd;
+	struct block_device *bdev;
 	struct blk_integrity *bi;
 	const char *bi_profile_name;
 
 	TRACE_ENTRY();
 
-	fd = vdev_open_fd(virt_dev, virt_dev->filename, virt_dev->rd_only);
-	if (IS_ERR(fd)) {
-		res = -EINVAL;
+	bdev = blkdev_get_by_path(virt_dev->filename, FMODE_READ,
+				  (void *)__func__);
+	if (IS_ERR(bdev)) {
+		res = PTR_ERR(bdev);
 		goto out;
 	}
 
-	inode = file_inode(fd);
-
-	if (!S_ISBLK(inode->i_mode)) {
-		PRINT_ERROR("%s is NOT a block device!", virt_dev->filename);
-		res = -EINVAL;
-		goto out_close;
-	}
-
-	bi = bdev_get_integrity(inode->i_bdev);
+	bi = bdev_get_integrity(bdev);
 	if (bi == NULL) {
 		TRACE_DBG("Block integrity not supported");
 		goto out_no_bi;
@@ -1099,7 +1070,7 @@ out_no_bi:
 	res = 0;
 
 out_close:
-	filp_close(fd, NULL);
+	blkdev_put(bdev, FMODE_READ);
 
 out:
 	TRACE_EXIT_RES(res);
@@ -1352,21 +1323,35 @@ static void vdisk_detach(struct scst_device *dev)
 	return;
 }
 
+static bool vdisk_is_open(const struct scst_vdisk_dev *virt_dev)
+{
+	return virt_dev->fd || virt_dev->bdev;
+}
+
 static int vdisk_open_fd(struct scst_vdisk_dev *virt_dev, bool read_only)
 {
 	int res;
 
 	sBUG_ON(!virt_dev->filename);
-	sBUG_ON(virt_dev->fd);
+	sBUG_ON(vdisk_is_open(virt_dev));
 
-	virt_dev->fd = vdev_open_fd(virt_dev, virt_dev->filename, read_only);
-	if (IS_ERR(virt_dev->fd)) {
-		res = PTR_ERR(virt_dev->fd);
+	if (virt_dev->blockio) {
+		virt_dev->bdev_mode = FMODE_READ;
+		if (!read_only)
+			virt_dev->bdev_mode |= FMODE_WRITE;
+		virt_dev->bdev = blkdev_get_by_path(virt_dev->filename,
+					virt_dev->bdev_mode, (void *)__func__);
+		res = IS_ERR(virt_dev->bdev) ? PTR_ERR(virt_dev->bdev) : 0;
+	} else {
+		virt_dev->fd = vdev_open_fd(virt_dev, virt_dev->filename,
+					    read_only);
+		res = IS_ERR(virt_dev->fd) ? PTR_ERR(virt_dev->fd) : 0;
+	}
+	if (res) {
+		virt_dev->bdev = NULL;
 		virt_dev->fd = NULL;
 		goto out;
 	}
-	virt_dev->bdev = virt_dev->blockio ? file_inode(virt_dev->fd)->i_bdev : NULL;
-	res = 0;
 
 	/*
 	 * For block devices, get the optimal I/O size from the block device
@@ -1386,32 +1371,49 @@ static int vdisk_open_fd(struct scst_vdisk_dev *virt_dev, bool read_only)
 		}
 	}
 
-	TRACE_DBG("virt_dev %s: fd %p open (dif_fd %p)", virt_dev->name,
-		virt_dev->fd, virt_dev->dif_fd);
+	TRACE_DBG("virt_dev %s: fd %p %p open (dif_fd %p)", virt_dev->name,
+		  virt_dev->fd, virt_dev->bdev, virt_dev->dif_fd);
 
 out:
 	return res;
 
 out_close_fd:
-	filp_close(virt_dev->fd, NULL);
-	virt_dev->fd = NULL;
+	if (virt_dev->blockio) {
+		blkdev_put(virt_dev->bdev, virt_dev->bdev_mode);
+		virt_dev->bdev = NULL;
+	} else {
+		filp_close(virt_dev->fd, NULL);
+		virt_dev->fd = NULL;
+	}
 	goto out;
 }
 
 static void vdisk_close_fd(struct scst_vdisk_dev *virt_dev)
 {
-	TRACE_DBG("virt_dev %s: closing fd %p (dif_fd %p)", virt_dev->name,
-		virt_dev->fd, virt_dev->dif_fd);
+	TRACE_DBG("virt_dev %s: closing fd %p %p (dif_fd %p)", virt_dev->name,
+		  virt_dev->fd, virt_dev->bdev, virt_dev->dif_fd);
 
-	if (virt_dev->fd) {
+	if (virt_dev->bdev) {
+		blkdev_put(virt_dev->bdev, virt_dev->bdev_mode);
+		virt_dev->bdev = NULL;
+	} else if (virt_dev->fd) {
 		filp_close(virt_dev->fd, NULL);
 		virt_dev->fd = NULL;
-		virt_dev->bdev = NULL;
 	}
 	if (virt_dev->dif_fd) {
 		filp_close(virt_dev->dif_fd, NULL);
 		virt_dev->dif_fd = NULL;
 	}
+}
+
+static int vdisk_reopen_fd(struct scst_vdisk_dev *virt_dev, bool read_only)
+{
+	/*
+	 * To do: make this function transactional. That means that it either
+	 * succeeds or does not modify the state of @virt_dev.
+	 */
+	vdisk_close_fd(virt_dev);
+	return vdisk_open_fd(virt_dev, read_only);
 }
 
 /* Invoked with scst_mutex held, so no further locking is necessary here. */
@@ -1426,7 +1428,7 @@ static int vdisk_attach_tgt(struct scst_tgt_dev *tgt_dev)
 
 	virt_dev->tgt_dev_cnt++;
 
-	if (virt_dev->fd != NULL)
+	if (vdisk_is_open(virt_dev))
 		goto out;
 
 	if (!virt_dev->nullio && !virt_dev->cdrom_empty) {
@@ -1442,6 +1444,7 @@ static int vdisk_attach_tgt(struct scst_tgt_dev *tgt_dev)
 		}
 	} else {
 		virt_dev->fd = NULL;
+		virt_dev->bdev = NULL;
 		virt_dev->dif_fd = NULL;
 	}
 
@@ -1689,9 +1692,9 @@ static int vdisk_format_dif(struct scst_cmd *cmd, uint64_t start_lba,
 	loff_t err = 0;
 	ssize_t full_len;
 	struct file *fd = virt_dev->dif_fd;
-	struct iovec *iv;
-	int max_iv_count, iv_count, i;
-	struct page *iv_page, *data_page;
+	struct kvec *kvec;
+	int max_kvec_segs, kvec_segs, i;
+	struct page *kvec_page, *data_page;
 	uint8_t *data_buf;
 	int64_t left, done;
 
@@ -1702,9 +1705,9 @@ static int vdisk_format_dif(struct scst_cmd *cmd, uint64_t start_lba,
 
 	EXTRACHECKS_BUG_ON(!(dev->dev_dif_mode & SCST_DIF_MODE_DEV_STORE));
 
-	iv_page = alloc_page(GFP_KERNEL);
-	if (iv_page == NULL) {
-		PRINT_ERROR("Unable to allocate iv page");
+	kvec_page = alloc_page(GFP_KERNEL);
+	if (kvec_page == NULL) {
+		PRINT_ERROR("Unable to allocate kvec page");
 		scst_set_busy(cmd);
 		res = -ENOMEM;
 		goto out;
@@ -1715,23 +1718,23 @@ static int vdisk_format_dif(struct scst_cmd *cmd, uint64_t start_lba,
 		PRINT_ERROR("Unable to allocate tags data page");
 		scst_set_busy(cmd);
 		res = -ENOMEM;
-		goto out_free_iv;
+		goto out_free_kvec;
 	}
 
 	data_buf = page_address(data_page);
 	memset(data_buf, 0xFF, PAGE_SIZE);
 
-	iv = page_address(iv_page);
-	max_iv_count = min_t(int, UIO_MAXIOV, (int)PAGE_SIZE/sizeof(*iv));
+	kvec = page_address(kvec_page);
+	max_kvec_segs = min_t(int, UIO_MAXIOV, (int)PAGE_SIZE/sizeof(*kvec));
 
-	for (i = 0; i < max_iv_count; i++)
-		iv[i].iov_base = (uint8_t __force __user *)data_buf;
+	for (i = 0; i < max_kvec_segs; i++)
+		kvec[i].iov_base = data_buf;
 
 	loff = start_lba << SCST_DIF_TAG_SHIFT;
 	left = blocks << SCST_DIF_TAG_SHIFT;
 	done = 0;
 	while (left > 0) {
-		iv_count = 0;
+		kvec_segs = 0;
 		full_len = 0;
 		i = -1;
 		while (1) {
@@ -1739,12 +1742,12 @@ static int vdisk_format_dif(struct scst_cmd *cmd, uint64_t start_lba,
 
 			full_len += len;
 			i++;
-			iv_count++;
-			iv[i].iov_len = len;
+			kvec_segs++;
+			kvec[i].iov_len = len;
 			left -= len;
 			done += len;
 			EXTRACHECKS_BUG_ON(left < 0);
-			if ((iv_count == max_iv_count) || (left == 0))
+			if (kvec_segs == max_kvec_segs || left == 0)
 				break;
 		}
 
@@ -1752,7 +1755,7 @@ static int vdisk_format_dif(struct scst_cmd *cmd, uint64_t start_lba,
 			full_len, (long long)loff);
 
 		/* WRITE */
-		err = scst_writev(fd, iv, iv_count, &loff);
+		err = scst_writev(fd, kvec, kvec_segs, &loff);
 		if (err < 0) {
 			PRINT_ERROR("Formatting DIF write() returned %lld from "
 				"%zd", err, full_len);
@@ -1781,8 +1784,8 @@ static int vdisk_format_dif(struct scst_cmd *cmd, uint64_t start_lba,
 out_free_data_page:
 	__free_page(data_page);
 
-out_free_iv:
-	__free_page(iv_page);
+out_free_kvec:
+	__free_page(kvec_page);
 
 out:
 	TRACE_EXIT_RES(res);
@@ -1831,7 +1834,6 @@ static int vdisk_unmap_range(struct scst_cmd *cmd,
 #else
 	int res;
 #endif
-	struct file *fd = virt_dev->fd;
 
 	TRACE_ENTRY();
 
@@ -1852,24 +1854,25 @@ static int vdisk_unmap_range(struct scst_cmd *cmd,
 		  (unsigned long long)start_lba, blocks);
 
 	if (virt_dev->blockio) {
+		struct block_device *bdev = virt_dev->bdev;
 #if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 27)
 		sector_t start_sector = start_lba << (cmd->dev->block_shift - 9);
 		sector_t nr_sects = blocks << (cmd->dev->block_shift - 9);
-		struct inode *inode = file_inode(fd);
 		gfp_t gfp = cmd->cmd_gfp_mask;
 
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(2, 6, 31)
-		err = blkdev_issue_discard(inode->i_bdev, start_sector, nr_sects, gfp);
+		err = blkdev_issue_discard(bdev, start_sector, nr_sects, gfp);
 #elif LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 35)       \
       && !(LINUX_VERSION_CODE == KERNEL_VERSION(2, 6, 34) \
 	   && defined(CONFIG_SUSE_KERNEL))
-		err = blkdev_issue_discard(inode->i_bdev, start_sector, nr_sects,
-				gfp, DISCARD_FL_WAIT);
+		err = blkdev_issue_discard(bdev, start_sector, nr_sects, gfp,
+					   DISCARD_FL_WAIT);
 #elif LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 37)
-		err = blkdev_issue_discard(inode->i_bdev, start_sector, nr_sects,
-				gfp, BLKDEV_IFL_WAIT);
+		err = blkdev_issue_discard(bdev, start_sector, nr_sects, gfp,
+					   BLKDEV_IFL_WAIT);
 #else
-		err = blkdev_issue_discard(inode->i_bdev, start_sector, nr_sects, gfp, 0);
+		err = blkdev_issue_discard(bdev, start_sector, nr_sects, gfp,
+					   0);
 #endif
 		if (unlikely(err != 0)) {
 			PRINT_ERROR("blkdev_issue_discard() for "
@@ -1888,6 +1891,7 @@ static int vdisk_unmap_range(struct scst_cmd *cmd,
 	} else {
 		loff_t off = start_lba << cmd->dev->block_shift;
 		loff_t len = blocks << cmd->dev->block_shift;
+		struct file *fd = virt_dev->fd;
 
 		res = vdisk_unmap_file_range(cmd, virt_dev, off, len, fd);
 		if (unlikely(res != 0))
@@ -3162,7 +3166,8 @@ static bool do_fileio_async(const struct vdisk_cmd_params *p)
 	}
 }
 
-static bool vdisk_alloc_kvec(struct scst_cmd *cmd, struct vdisk_cmd_params *p)
+static bool vdisk_alloc_async_kvec(struct scst_cmd *cmd,
+				   struct vdisk_cmd_params *p)
 {
 	int n;
 
@@ -3175,7 +3180,7 @@ static bool vdisk_alloc_kvec(struct scst_cmd *cmd, struct vdisk_cmd_params *p)
 	p->async.kvec = kmalloc_array(n, sizeof(*p->async.kvec),
 				      cmd->cmd_gfp_mask);
 	if (p->async.kvec == NULL) {
-		PRINT_ERROR("Unable to allocate kvecv (%d)", n);
+		PRINT_ERROR("Unable to allocate kvec (%d)", n);
 		return false;
 	}
 
@@ -3239,7 +3244,7 @@ static enum compl_status_e fileio_exec_async(struct vdisk_cmd_params *p)
 		return CMD_FAILED;
 	}
 
-	if (!vdisk_alloc_kvec(cmd, p)) {
+	if (!vdisk_alloc_async_kvec(cmd, p)) {
 		scst_set_busy(cmd);
 		return CMD_SUCCEEDED;
 	}
@@ -3308,8 +3313,8 @@ static enum compl_status_e fileio_exec_async(struct vdisk_cmd_params *p)
 static void vdisk_on_free_cmd_params(const struct vdisk_cmd_params *p)
 {
 	if (!p->execute_async) {
-		if (p->sync.iv != p->sync.small_iv)
-			kfree(p->sync.iv);
+		if (p->sync.kvec != p->sync.small_kvec)
+			kfree(p->sync.kvec);
 	}
 }
 
@@ -3409,7 +3414,7 @@ static enum scst_exec_res blockio_exec(struct scst_cmd *cmd)
 	if (unlikely(!vdisk_parse_offset(&p, cmd)))
 		goto err;
 
-	if (unlikely(virt_dev->fd == NULL)) {
+	if (unlikely(virt_dev->bdev == NULL)) {
 		if (!vdisk_no_fd_allowed_commands(cmd)) {
 			/*
 			 * We should not get here, unless the user space
@@ -4537,7 +4542,6 @@ out_not_sup:
 static int vdisk_set_wt(struct scst_vdisk_dev *virt_dev, int wt, bool read_only)
 {
 	int res = 0;
-	struct file *fd, *dif_fd = NULL;
 	bool old_wt = virt_dev->wt_flag;
 
 	TRACE_ENTRY();
@@ -4549,41 +4553,19 @@ static int vdisk_set_wt(struct scst_vdisk_dev *virt_dev, int wt, bool read_only)
 	virt_dev->wt_flag = wt;
 	spin_unlock(&virt_dev->flags_lock);
 
-	if (virt_dev->fd == NULL)
-		goto out;
-
 	/*
-	 * MODE SELECT is strictly serialized command, so it's safe here
-	 * to reopen fd.
+	 * MODE SELECT is a strictly serialized command so it's safe to reopen
+	 * the fd.
 	 */
-
-	fd = vdev_open_fd(virt_dev, virt_dev->filename, read_only);
-	if (IS_ERR(fd)) {
-		res = PTR_ERR(fd);
-		goto out_err;
+	if (vdisk_is_open(virt_dev)) {
+		res = vdisk_reopen_fd(virt_dev, read_only);
+		if (res < 0)
+			goto out_err;
 	}
-
-	if (virt_dev->dif_filename != NULL) {
-		dif_fd = vdev_open_fd(virt_dev, virt_dev->dif_filename, read_only);
-		if (IS_ERR(dif_fd)) {
-			res = PTR_ERR(dif_fd);
-			goto out_err_close_fd;
-		}
-	}
-
-	filp_close(virt_dev->fd, NULL);
-	if (virt_dev->dif_fd)
-		filp_close(virt_dev->dif_fd, NULL);
-
-	virt_dev->fd = fd;
-	virt_dev->dif_fd = dif_fd;
 
 out:
 	TRACE_EXIT_RES(res);
 	return res;
-
-out_err_close_fd:
-	filp_close(fd, NULL);
 
 out_err:
 	spin_lock(&virt_dev->flags_lock);
@@ -5195,30 +5177,30 @@ static enum compl_status_e vdisk_exec_prevent_allow_medium_removal(struct vdisk_
 	return CMD_SUCCEEDED;
 }
 
-static struct iovec *vdisk_alloc_iv(struct scst_cmd *cmd,
-				    struct vdisk_cmd_params *p)
+static struct kvec *vdisk_alloc_sync_kvec(struct scst_cmd *cmd,
+					  struct vdisk_cmd_params *p)
 {
-	int iv_count;
+	int kvec_segs;
 
-	iv_count = min_t(int, scst_get_buf_count(cmd), UIO_MAXIOV);
-	if (iv_count > p->sync.iv_count) {
-		if (p->sync.iv != p->sync.small_iv)
-			kfree(p->sync.iv);
-		p->sync.iv_count = 0;
+	kvec_segs = min_t(int, scst_get_buf_count(cmd), UIO_MAXIOV);
+	if (kvec_segs > p->sync.kvec_segs) {
+		if (p->sync.kvec != p->sync.small_kvec)
+			kfree(p->sync.kvec);
+		p->sync.kvec_segs = 0;
 		/* It can't be called in atomic context */
-		p->sync.iv = iv_count <= ARRAY_SIZE(p->sync.small_iv) ?
-			p->sync.small_iv :
-			kmalloc_array(iv_count, sizeof(*p->sync.iv),
+		p->sync.kvec = kvec_segs <= ARRAY_SIZE(p->sync.small_kvec) ?
+			p->sync.small_kvec :
+			kmalloc_array(kvec_segs, sizeof(*p->sync.kvec),
 				      cmd->cmd_gfp_mask);
-		if (p->sync.iv == NULL) {
-			PRINT_ERROR("Unable to allocate iv (%d)", iv_count);
+		if (p->sync.kvec == NULL) {
+			PRINT_ERROR("Unable to allocate kvec (%d)", kvec_segs);
 			goto out;
 		}
-		p->sync.iv_count = iv_count;
+		p->sync.kvec_segs = kvec_segs;
 	}
 
 out:
-	return p->sync.iv;
+	return p->sync.kvec;
 }
 
 static enum compl_status_e nullio_exec_read(struct vdisk_cmd_params *p)
@@ -5262,8 +5244,8 @@ static int vdev_read_dif_tags(struct vdisk_cmd_params *p)
 	uint8_t *address;
 	struct scst_vdisk_dev *virt_dev = cmd->dev->dh_priv;
 	struct file *fd = virt_dev->dif_fd;
-	struct iovec *iv;
-	int iv_count, max_iv_count, i;
+	struct kvec *kvec;
+	int kvec_segs, max_kvec_segs, i;
 	bool finished = false;
 	int tags_num, l;
 	struct scatterlist *tags_sg;
@@ -5283,10 +5265,10 @@ static int vdev_read_dif_tags(struct vdisk_cmd_params *p)
 	if (unlikely(tags_num == 0))
 		goto out;
 
-	iv = p->sync.iv;
-	if (iv == NULL) {
-		iv = vdisk_alloc_iv(cmd, p);
-		if (iv == NULL) {
+	kvec = p->sync.kvec;
+	if (kvec == NULL) {
+		kvec = vdisk_alloc_sync_kvec(cmd, p);
+		if (kvec == NULL) {
 			unsigned long flags;
 
 			/* To protect sense setting against blockio data reads */
@@ -5297,12 +5279,12 @@ static int vdev_read_dif_tags(struct vdisk_cmd_params *p)
 			goto out;
 		}
 	}
-	max_iv_count = p->sync.iv_count;
+	max_kvec_segs = p->sync.kvec_segs;
 
 	tags_sg = NULL;
 	loff = (p->loff >> cmd->dev->block_shift) << SCST_DIF_TAG_SHIFT;
 	while (1) {
-		iv_count = 0;
+		kvec_segs = 0;
 		full_len = 0;
 		i = -1;
 		address = scst_get_dif_buf(cmd, &tags_sg, &l);
@@ -5311,12 +5293,12 @@ static int vdev_read_dif_tags(struct vdisk_cmd_params *p)
 		while (1) {
 			full_len += length;
 			i++;
-			iv_count++;
-			iv[i].iov_base = (uint8_t __force __user *)address;
-			iv[i].iov_len = length;
+			kvec_segs++;
+			kvec[i].iov_base = address;
+			kvec[i].iov_len = length;
 			tags_num -= length >> SCST_DIF_TAG_SHIFT;
 			EXTRACHECKS_BUG_ON(tags_num < 0);
-			if ((iv_count == max_iv_count) || (tags_num == 0))
+			if (kvec_segs == max_kvec_segs || tags_num == 0)
 				break;
 			address = scst_get_dif_buf(cmd, &tags_sg, &l);
 			length = l;
@@ -5325,11 +5307,11 @@ static int vdev_read_dif_tags(struct vdisk_cmd_params *p)
 		if (tags_num == 0)
 			finished = true;
 
-		TRACE_DBG("Reading DIF iv_count %d, full_len %zd, loff %lld",
-			iv_count, full_len, (long long)loff);
+		TRACE_DBG("Reading DIF kvec_segs %d, full_len %zd, loff %lld",
+			kvec_segs, full_len, (long long)loff);
 
 		/* READ */
-		err = scst_readv(fd, iv, iv_count, &loff);
+		err = scst_readv(fd, kvec, kvec_segs, &loff);
 		if ((err < 0) || (err < full_len)) {
 			unsigned long flags;
 
@@ -5349,8 +5331,8 @@ static int vdev_read_dif_tags(struct vdisk_cmd_params *p)
 			goto out_put_dif_buf;
 		}
 
-		for (i = 0; i < iv_count; i++)
-			scst_put_dif_buf(cmd, (void __force *)(iv[i].iov_base));
+		for (i = 0; i < kvec_segs; i++)
+			scst_put_dif_buf(cmd, kvec[i].iov_base);
 
 		if (finished)
 			break;
@@ -5361,8 +5343,8 @@ out:
 	return res;
 
 out_put_dif_buf:
-	for (i = 0; i < iv_count; i++)
-		scst_put_dif_buf(cmd, (void __force *)(iv[i].iov_base));
+	for (i = 0; i < kvec_segs; i++)
+		scst_put_dif_buf(cmd, kvec[i].iov_base);
 	goto out;
 }
 
@@ -5376,8 +5358,8 @@ static int vdev_write_dif_tags(struct vdisk_cmd_params *p)
 	uint8_t *address;
 	struct scst_vdisk_dev *virt_dev = cmd->dev->dh_priv;
 	struct file *fd = virt_dev->dif_fd;
-	struct iovec *iv, *eiv;
-	int iv_count, eiv_count, max_iv_count, i;
+	struct kvec *kvec, *ekvec;
+	int kvec_segs, ekvec_segs, max_kvec_segs, i;
 	bool finished = false;
 	int tags_num, l;
 	struct scatterlist *tags_sg;
@@ -5397,10 +5379,10 @@ static int vdev_write_dif_tags(struct vdisk_cmd_params *p)
 	if (unlikely(tags_num == 0))
 		goto out;
 
-	iv = p->sync.iv;
-	if (iv == NULL) {
-		iv = vdisk_alloc_iv(cmd, p);
-		if (iv == NULL) {
+	kvec = p->sync.kvec;
+	if (kvec == NULL) {
+		kvec = vdisk_alloc_sync_kvec(cmd, p);
+		if (kvec == NULL) {
 			unsigned long flags;
 
 			/* To protect sense setting against blockio data writes */
@@ -5411,12 +5393,12 @@ static int vdev_write_dif_tags(struct vdisk_cmd_params *p)
 			goto out;
 		}
 	}
-	max_iv_count = p->sync.iv_count;
+	max_kvec_segs = p->sync.kvec_segs;
 
 	tags_sg = NULL;
 	loff = (p->loff >> cmd->dev->block_shift) << SCST_DIF_TAG_SHIFT;
 	while (1) {
-		iv_count = 0;
+		kvec_segs = 0;
 		full_len = 0;
 		i = -1;
 		address = scst_get_dif_buf(cmd, &tags_sg, &l);
@@ -5425,12 +5407,12 @@ static int vdev_write_dif_tags(struct vdisk_cmd_params *p)
 		while (1) {
 			full_len += length;
 			i++;
-			iv_count++;
-			iv[i].iov_base = (uint8_t __force __user *)address;
-			iv[i].iov_len = length;
+			kvec_segs++;
+			kvec[i].iov_base = address;
+			kvec[i].iov_len = length;
 			tags_num -= length >> SCST_DIF_TAG_SHIFT;
 			EXTRACHECKS_BUG_ON(tags_num < 0);
-			if ((iv_count == max_iv_count) || (tags_num == 0))
+			if (kvec_segs == max_kvec_segs || tags_num == 0)
 				break;
 			address = scst_get_dif_buf(cmd, &tags_sg, &l);
 			length = l;
@@ -5439,13 +5421,13 @@ static int vdev_write_dif_tags(struct vdisk_cmd_params *p)
 		if (tags_num == 0)
 			finished = true;
 
-		eiv = iv;
-		eiv_count = iv_count;
+		ekvec = kvec;
+		ekvec_segs = kvec_segs;
 restart:
-		TRACE_DBG("Writing DIF: eiv_count %d, full_len %zd", eiv_count, full_len);
+		TRACE_DBG("Writing DIF: ekvec_segs %d, full_len %zd", ekvec_segs, full_len);
 
 		/* WRITE */
-		err = scst_writev(fd, eiv, eiv_count, &loff);
+		err = scst_writev(fd, ekvec, ekvec_segs, &loff);
 		if (err < 0) {
 			unsigned long flags;
 
@@ -5467,33 +5449,32 @@ restart:
 			 * Probably that's wrong, but sometimes write() returns
 			 * value less, than requested. Let's restart.
 			 */
-			int e = eiv_count;
+			int e = ekvec_segs;
 
 			TRACE_MGMT_DBG("DIF write() returned %d from %zd "
-				"(iv_count=%d)", (int)err, full_len,
-				eiv_count);
+				"(kvec_segs=%d)", (int)err, full_len,
+				ekvec_segs);
 			if (err == 0) {
 				PRINT_INFO("Suspicious: DIF write() returned 0 from "
-					"%zd (iv_count=%d)", full_len, eiv_count);
+					"%zd (kvec_segs=%d)", full_len, ekvec_segs);
 			}
 			full_len -= err;
 			for (i = 0; i < e; i++) {
-				if ((long long)eiv->iov_len < err) {
-					err -= eiv->iov_len;
-					eiv++;
-					eiv_count--;
+				if ((long long)ekvec->iov_len < err) {
+					err -= ekvec->iov_len;
+					ekvec++;
+					ekvec_segs--;
 				} else {
-					eiv->iov_base =
-					    (uint8_t __force __user *)eiv->iov_base + err;
-					eiv->iov_len -= err;
+					ekvec->iov_base = ekvec->iov_base + err;
+					ekvec->iov_len -= err;
 					break;
 				}
 			}
 			goto restart;
 		}
 
-		for (i = 0; i < iv_count; i++)
-			scst_put_dif_buf(cmd, (void __force *)(iv[i].iov_base));
+		for (i = 0; i < kvec_segs; i++)
+			scst_put_dif_buf(cmd, kvec[i].iov_base);
 
 		if (finished)
 			break;
@@ -5504,8 +5485,8 @@ out:
 	return res;
 
 out_put_dif_buf:
-	for (i = 0; i < iv_count; i++)
-		scst_put_dif_buf(cmd, (void __force *)(iv[i].iov_base));
+	for (i = 0; i < kvec_segs; i++)
+		scst_put_dif_buf(cmd, kvec[i].iov_base);
 	goto out;
 }
 
@@ -5563,8 +5544,8 @@ static enum compl_status_e fileio_exec_write(struct vdisk_cmd_params *p)
 	uint8_t *address;
 	struct scst_vdisk_dev *virt_dev = cmd->dev->dh_priv;
 	struct file *fd = virt_dev->fd;
-	struct iovec *iv, *eiv;
-	int rc, i, iv_count, eiv_count, max_iv_count;
+	struct kvec *kvec, *ekvec;
+	int rc, i, kvec_segs, ekvec_segs, max_kvec_segs;
 	bool finished = false;
 
 	TRACE_ENTRY();
@@ -5578,11 +5559,11 @@ static enum compl_status_e fileio_exec_write(struct vdisk_cmd_params *p)
 	if (unlikely(rc != 0))
 		goto out;
 
-	iv = vdisk_alloc_iv(cmd, p);
-	if (iv == NULL)
+	kvec = vdisk_alloc_sync_kvec(cmd, p);
+	if (kvec == NULL)
 		goto out_nomem;
 
-	max_iv_count = p->sync.iv_count;
+	max_kvec_segs = p->sync.kvec_segs;
 
 	length = scst_get_buf_first(cmd, &address);
 	if (unlikely(length < 0)) {
@@ -5593,22 +5574,22 @@ static enum compl_status_e fileio_exec_write(struct vdisk_cmd_params *p)
 	}
 
 	while (1) {
-		iv_count = 0;
+		kvec_segs = 0;
 		full_len = 0;
 		i = -1;
 		while (length > 0) {
 			full_len += length;
 			i++;
-			iv_count++;
-			iv[i].iov_base = (uint8_t __force __user *)address;
-			iv[i].iov_len = length;
-			if (iv_count == max_iv_count)
+			kvec_segs++;
+			kvec[i].iov_base = address;
+			kvec[i].iov_len = length;
+			if (kvec_segs == max_kvec_segs)
 				break;
 			length = scst_get_buf_next(cmd, &address);
 		}
 		if (length == 0) {
 			finished = true;
-			if (unlikely(iv_count == 0))
+			if (unlikely(kvec_segs == 0))
 				break;
 		} else if (unlikely(length < 0)) {
 			PRINT_ERROR("scst_get_buf_next() failed: %zd", length);
@@ -5617,13 +5598,13 @@ static enum compl_status_e fileio_exec_write(struct vdisk_cmd_params *p)
 			goto out_put_buf;
 		}
 
-		eiv = iv;
-		eiv_count = iv_count;
+		ekvec = kvec;
+		ekvec_segs = kvec_segs;
 restart:
-		TRACE_DBG("Writing: eiv_count %d, full_len %zd", eiv_count, full_len);
+		TRACE_DBG("Writing: ekvec_segs %d, full_len %zd", ekvec_segs, full_len);
 
 		/* WRITE */
-		err = scst_writev(fd, eiv, eiv_count, &loff);
+		err = scst_writev(fd, ekvec, ekvec_segs, &loff);
 		if (err < 0) {
 			PRINT_ERROR("write() returned %lld from %zd",
 				    (unsigned long long)err,
@@ -5643,32 +5624,32 @@ restart:
 			 * Probably that's wrong, but sometimes write() returns
 			 * value less, than requested. Let's restart.
 			 */
-			int e = eiv_count;
+			int e = ekvec_segs;
 
 			TRACE_MGMT_DBG("write() returned %d from %zd "
-				"(iv_count=%d)", (int)err, full_len,
-				eiv_count);
+				"(kvec_segs=%d)", (int)err, full_len,
+				ekvec_segs);
 			if (err == 0) {
 				PRINT_INFO("Suspicious: write() returned 0 from "
-					"%zd (iv_count=%d)", full_len, eiv_count);
+					"%zd (kvec_segs=%d)", full_len, ekvec_segs);
 			}
 			full_len -= err;
 			for (i = 0; i < e; i++) {
-				if ((long long)eiv->iov_len < err) {
-					err -= eiv->iov_len;
-					eiv++;
-					eiv_count--;
+				if ((long long)ekvec->iov_len < err) {
+					err -= ekvec->iov_len;
+					ekvec++;
+					ekvec_segs--;
 				} else {
-					eiv->iov_base += err;
-					eiv->iov_len -= err;
+					ekvec->iov_base += err;
+					ekvec->iov_len -= err;
 					break;
 				}
 			}
 			goto restart;
 		}
 
-		for (i = 0; i < iv_count; i++)
-			scst_put_buf(cmd, (void __force *)(iv[i].iov_base));
+		for (i = 0; i < kvec_segs; i++)
+			scst_put_buf(cmd, kvec[i].iov_base);
 
 		if (finished)
 			break;
@@ -5693,8 +5674,8 @@ out:
 	return CMD_SUCCEEDED;
 
 out_put_buf:
-	for (i = 0; i < iv_count; i++)
-		scst_put_buf(cmd, (void __force *)(iv[i].iov_base));
+	for (i = 0; i < kvec_segs; i++)
+		scst_put_buf(cmd, kvec[i].iov_base);
 	goto out_sync;
 
 out_nomem:
@@ -6270,12 +6251,12 @@ static enum compl_status_e fileio_exec_read(struct vdisk_cmd_params *p)
 	loff_t loff = p->loff;
 	loff_t err = 0;
 	ssize_t length, full_len;
-	uint8_t __user *address;
+	uint8_t *address;
 	struct scst_device *dev = cmd->dev;
 	struct scst_vdisk_dev *virt_dev = dev->dh_priv;
 	struct file *fd = virt_dev->fd;
-	struct iovec *iv;
-	int iv_count, i, max_iv_count;
+	struct kvec *kvec;
+	int kvec_segs, i, max_kvec_segs;
 	bool finished = false;
 
 	TRACE_ENTRY();
@@ -6285,13 +6266,13 @@ static enum compl_status_e fileio_exec_read(struct vdisk_cmd_params *p)
 	if (do_fileio_async(p))
 		return fileio_exec_async(p);
 
-	iv = vdisk_alloc_iv(cmd, p);
-	if (iv == NULL)
+	kvec = vdisk_alloc_sync_kvec(cmd, p);
+	if (kvec == NULL)
 		goto out_nomem;
 
-	max_iv_count = p->sync.iv_count;
+	max_kvec_segs = p->sync.kvec_segs;
 
-	length = scst_get_buf_first(cmd, (uint8_t __force **)&address);
+	length = scst_get_buf_first(cmd, &address);
 	if (unlikely(length < 0)) {
 		PRINT_ERROR("scst_get_buf_first() failed: %zd", length);
 		scst_set_cmd_error(cmd,
@@ -6300,23 +6281,22 @@ static enum compl_status_e fileio_exec_read(struct vdisk_cmd_params *p)
 	}
 
 	while (1) {
-		iv_count = 0;
+		kvec_segs = 0;
 		full_len = 0;
 		i = -1;
 		while (length > 0) {
 			full_len += length;
 			i++;
-			iv_count++;
-			iv[i].iov_base = address;
-			iv[i].iov_len = length;
-			if (iv_count == max_iv_count)
+			kvec_segs++;
+			kvec[i].iov_base = address;
+			kvec[i].iov_len = length;
+			if (kvec_segs == max_kvec_segs)
 				break;
-			length = scst_get_buf_next(cmd,
-				(uint8_t __force **)&address);
+			length = scst_get_buf_next(cmd, &address);
 		}
 		if (length == 0) {
 			finished = true;
-			if (unlikely(iv_count == 0))
+			if (unlikely(kvec_segs == 0))
 				break;
 		} else if (unlikely(length < 0)) {
 			PRINT_ERROR("scst_get_buf_next() failed: %zd", length);
@@ -6325,10 +6305,10 @@ static enum compl_status_e fileio_exec_read(struct vdisk_cmd_params *p)
 			goto out_put_buf;
 		}
 
-		TRACE_DBG("Reading iv_count %d, full_len %zd", iv_count, full_len);
+		TRACE_DBG("Reading kvec_segs %d, full_len %zd", kvec_segs, full_len);
 
 		/* READ */
-		err = scst_readv(fd, iv, iv_count, &loff);
+		err = scst_readv(fd, kvec, kvec_segs, &loff);
 		if ((err < 0) || (err < full_len)) {
 			PRINT_ERROR("readv() returned %lld from %zd",
 				    (unsigned long long)err,
@@ -6342,13 +6322,13 @@ static enum compl_status_e fileio_exec_read(struct vdisk_cmd_params *p)
 			goto out_put_buf;
 		}
 
-		for (i = 0; i < iv_count; i++)
-			scst_put_buf(cmd, (void __force *)(iv[i].iov_base));
+		for (i = 0; i < kvec_segs; i++)
+			scst_put_buf(cmd, kvec[i].iov_base);
 
 		if (finished)
 			break;
 
-		length = scst_get_buf_next(cmd, (uint8_t __force **)&address);
+		length = scst_get_buf_next(cmd, &address);
 	}
 
 	if ((dev->dev_dif_mode & SCST_DIF_MODE_DEV_STORE) &&
@@ -6365,8 +6345,8 @@ out:
 	return CMD_SUCCEEDED;
 
 out_put_buf:
-	for (i = 0; i < iv_count; i++)
-		scst_put_buf(cmd, (void __force *)(iv[i].iov_base));
+	for (i = 0; i < kvec_segs; i++)
+		scst_put_buf(cmd, kvec[i].iov_base);
 	goto out;
 
 out_nomem:
@@ -6797,7 +6777,7 @@ static int vdisk_create_bioset(struct scst_vdisk_dev *virt_dev)
 		/* The same, pool size doesn't really matter */
 		res = bioset_integrity_create(virt_dev->vdisk_bioset, 2);
 #else
-		res = -ENOTSUPP;
+		res = -EOPNOTSUPP;
 #endif
 		if (res != 0) {
 			PRINT_ERROR("Failed to create integrity bioset "
@@ -7661,24 +7641,20 @@ out:
 }
 
 
-static int vcdrom_change(struct scst_vdisk_dev *virt_dev,
-	char *buffer)
+static int vcdrom_change(struct scst_vdisk_dev *virt_dev, char *buffer)
 {
 	loff_t err;
-	char *old_fn, *p, *pp;
+	char *old_fn, *p;
 	bool old_empty;
-	struct file *old_fd;
-	struct file *old_dif_fd;
 	const char *filename = NULL;
 	int length = strlen(buffer);
 	int res = 0;
 
 	TRACE_ENTRY();
 
-	TRACE_DBG("virt_dev %s, empty %d, fd %p (dif_fd %p), filename %p", virt_dev->name,
-		virt_dev->cdrom_empty, virt_dev->fd, virt_dev->dif_fd, virt_dev->filename);
-
-	sBUG_ON(virt_dev->dif_fd); /* DIF is not supported for CDROMs */
+	TRACE_DBG("virt_dev %s, empty %d, fd %p (dif_fd %p), filename %p",
+		  virt_dev->name, virt_dev->cdrom_empty, virt_dev->fd,
+		  virt_dev->dif_fd, virt_dev->filename);
 
 	if (virt_dev->prevent_allow_medium_removal) {
 		PRINT_ERROR("Prevent medium removal for "
@@ -7689,16 +7665,16 @@ static int vcdrom_change(struct scst_vdisk_dev *virt_dev,
 
 	p = buffer;
 
+	/* Skip leading whitespace */
 	while (isspace(*p) && *p != '\0')
 		p++;
 	filename = p;
+	/* Strip trailing whitespace */
+	WARN_ON_ONCE(length == 0);
 	p = &buffer[length-1];
-	pp = &buffer[length];
-	while (isspace(*p) && (*p != '\0')) {
-		pp = p;
+	while (p > buffer && isspace(*p))
 		p--;
-	}
-	*pp = '\0';
+	p[1] = '\0';
 
 	res = scst_suspend_activity(SCST_SUSPEND_TIMEOUT_USER);
 	if (res != 0)
@@ -7708,8 +7684,6 @@ static int vcdrom_change(struct scst_vdisk_dev *virt_dev,
 	mutex_lock(&scst_mutex);
 
 	old_empty = virt_dev->cdrom_empty;
-	old_fd = virt_dev->fd;
-	old_dif_fd = virt_dev->dif_fd;
 	old_fn = virt_dev->filename;
 
 	if (*filename == '\0') {
@@ -7736,24 +7710,17 @@ static int vcdrom_change(struct scst_vdisk_dev *virt_dev,
 		res = vdisk_get_file_size(virt_dev, &err);
 		if (res != 0)
 			goto out_free_fn;
-		if (virt_dev->fd == NULL) {
-			res = vdisk_open_fd(virt_dev, true);
+		if (!vdisk_is_open(virt_dev)) {
+			res = vdisk_reopen_fd(virt_dev, true);
 			if (res != 0)
 				goto out_free_fn;
 			sBUG_ON(!virt_dev->fd);
-
-			TRACE_DBG("Closing old_fd %p", old_fd);
-			if (old_fd != NULL)
-				filp_close(old_fd, NULL);
-			if (old_dif_fd != NULL)
-				filp_close(old_dif_fd, NULL);
-			old_fd = NULL;
-			old_dif_fd = NULL;
 		}
 	} else {
 		err = 0;
 		virt_dev->filename = NULL;
 		virt_dev->fd = NULL;
+		virt_dev->bdev = NULL;
 	}
 
 	virt_dev->file_size = err;
@@ -7791,7 +7758,6 @@ out:
 	return res;
 
 out_free_fn:
-	virt_dev->fd = old_fd;
 	kfree(virt_dev->filename);
 	virt_dev->filename = old_fn;
 
@@ -7911,7 +7877,7 @@ static int vdev_size_process_store(struct scst_sysfs_work_item *work)
 
 	virt_dev = dev->dh_priv;
 
-	queue_ua = (virt_dev->fd != NULL);
+	queue_ua = vdisk_is_open(virt_dev);
 
 	if ((new_size & ((1 << virt_dev->blk_shift) - 1)) == 0) {
 		virt_dev->file_size = new_size;
@@ -10076,18 +10042,15 @@ static void init_ops(vdisk_op_fn *ops, int count)
 static int __init vdev_check_mode_pages_path(void)
 {
 	int res;
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 39)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 28)
 	struct nameidata nd;
 #else
 	struct path path;
 #endif
-	mm_segment_t old_fs = get_fs();
 
 	TRACE_ENTRY();
 
-	set_fs(KERNEL_DS);
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 39)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 28)
 	res = path_lookup(VDEV_MODE_PAGES_DIR, 0, &nd);
 	if (res == 0)
 		scst_path_put(&nd);
@@ -10101,11 +10064,7 @@ static int __init vdev_check_mode_pages_path(void)
 			"disabled. You should create this directory manually "
 			"or reinstall SCST", VDEV_MODE_PAGES_DIR, res);
 		vdev_saved_mode_pages_enabled = false;
-		goto out_setfs;
 	}
-
-out_setfs:
-	set_fs(old_fs);
 
 	res = 0; /* always succeed */
 

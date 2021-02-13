@@ -4880,7 +4880,7 @@ static struct kobj_type scst_session_ktype = {
 		       scst_sess_latency_store);			\
 	static struct kobj_attribute sess_lat_attr_b##size =		\
 		__ATTR(b##size, S_IRUGO | S_IWUSR, scst_sess_latency_show, \
-		       scst_sess_latency_store);
+		       scst_sess_latency_store)
 SCST_LAT_ATTR(512);
 SCST_LAT_ATTR(1024);
 SCST_LAT_ATTR(2048);
@@ -6986,7 +6986,7 @@ static void scst_free_lat_stats_mem(void)
 		list_for_each_entry(tgt, &tt->tgt_list, tgt_list_entry) {
 			list_for_each_entry(sess, &tgt->sess_list,
 					    sess_list_entry) {
-				vfree(sess->lat_stats);
+				kvfree(sess->lat_stats);
 				sess->lat_stats = NULL;
 			}
 		}
